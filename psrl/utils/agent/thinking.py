@@ -2,6 +2,10 @@
 
 TITO hashes `reasoning_content` into each trajectory. Harnesses that omit it
 during replay can fork a new trajectory on every turn.
+
+Every mode here shapes a request to PSRL's own gateway, which is also what makes
+them inert against a third-party endpoint: that endpoint owns its chat template
+and silently drops fields it does not recognise.
 """
 
 from __future__ import annotations
