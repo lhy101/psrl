@@ -42,10 +42,14 @@ tensorflow/my_graph/*
 
 # Common artifact directories
 **/checkpoints
+**/ckpts
 **/wget-log
 **/_build/
 **/outputs
 **/outputs/
+
+# Talk material. Cites cluster-side measurements that stay out of published docs.
+examples/sciaccel_rl/slides/
 **/output/
 **/playground
 **/wandb
@@ -56,6 +60,7 @@ tensorflow/my_graph/*
 !psrl/eval/config/topology/
 **/models/
 **/data/
+**/results/
 
 
 # =========================================================================

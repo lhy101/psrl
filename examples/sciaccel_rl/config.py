@@ -23,6 +23,15 @@ class HarborConfig:
     agent_name: str = "terminus-2"
     override_gpus: int | None = None
     gpu_compose_override: str = ""
+    # Byte cap on one terminal observation. Harbor hardcodes 10000, so a lower value
+    # needs the `agent.py` subclass that `agent_name` must point at.
+    max_observation_bytes: int = 10000
+    # Raise the task container memory above the `task.toml` declaration. A verifier whose
+    # solver dies mid-run can hang instead of failing cleanly. Zero keeps the task's value.
+    memory_mb_override: int = 0
+    # Harbor containers are invisible to Ray scheduling, so nothing else bounds this.
+    # Teardown is asynchronous, so an episode's containers outlive it.
+    max_concurrent_episodes: int = 8
 
 
 @dataclass

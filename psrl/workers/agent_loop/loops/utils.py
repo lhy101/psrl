@@ -69,6 +69,48 @@ class TerminateReason(Enum):
         )
 
     @property
+    def is_ungraded(self) -> bool:
+        """Return whether the episode ran but never received a verifier score.
+
+        The trajectory is real on-policy data, so `is_successful` keeps it, but no
+        grader ever looked at it. A reward of 0 here is the absence of a measurement,
+        not a measured failure, and nothing downstream can tell the two apart once the
+        empty reward dict has defaulted to 0.0.
+
+        Training it as a zero is worse than dropping it: siblings of the same task in
+        the same GRPO group split 0.0 against 1.0 purely on whether a container timed
+        out, which is a gradient of pure infrastructure noise pointing in a direction
+        the policy cannot influence.
+        """
+        return self is TerminateReason.VERIFIER_ERROR
+
+    @property
+    def is_budget_truncated(self) -> bool:
+        """Return whether a harness budget cut the episode off mid-work.
+
+        These trajectories are still valid on-policy data, so `is_successful` keeps
+        them, but their reward reports the cutoff rather than the quality of the
+        model's choices. Grading a run that was never allowed to finish as a failure
+        makes the group-relative advantage penalise every token in it, and under
+        `token-mean` a long truncated trajectory outweighs many short ones. The
+        cheapest way for the policy to shed that penalty is to emit fewer tokens per
+        turn, which spends the turn cap faster and truncates more often.
+
+        Measured over 1983 episodes of GRPO-sciaccel-Qwen35-4B-v2_repair-L1: tokens
+        per turn fell 1125 to 327, `max_turns_exceeded` rose from 29% to 39%, and the
+        score collapsed from 0.573 at step 11 to 0.078 at step 16.
+
+        `AGENT_TIMEOUT` and `ENV_TIMEOUT` are excluded deliberately, because they are
+        infrastructure faults rather than budget exhaustion. `VERIFIER_ERROR` is
+        excluded too and handled by `is_ungraded`, which masks it for a different
+        reason: its tokens are honest, but its reward was never measured.
+        """
+        return self in (
+            TerminateReason.MAX_TURNS_EXCEEDED,
+            TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
+        )
+
+    @property
     def is_timeout(self) -> bool:
         """Return whether a timeout stopped the trajectory before it produced data.
 

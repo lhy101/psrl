@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train Qwen3.5-4B on the SciAccel v2 task bank with GRPO.
+# Train Qwen3.5-4B on the SciAccel-RL task bank with GRPO.
 # Environment variables override model, sequence, topology, and checkpoint settings.
 
 set -xeuo pipefail
@@ -22,9 +22,19 @@ PSRL_PATH=${PSRL_PATH:-$(python3 -c "import os, psrl; print(os.path.dirname(os.p
 # --- Model and data ---
 
 # The 4B model leaves more activation memory for long contexts.
-HF_MODEL_PATH=${HF_MODEL_PATH:-/apdcephfs_zwfy10_303541817/share_303541817/lhy/models/Qwen3.5-4B}
-train_files=${PSRL_PATH}/examples/sciaccel_rl/data/v2/train.parquet
-val_files=${PSRL_PATH}/examples/sciaccel_rl/data/v2/val.parquet
+HF_MODEL_PATH=${HF_MODEL_PATH:-${PSRL_WORKSPACE:-}/models/Qwen3.5-4B}
+# `L1` adds file, line, and defect note, `L2` drops the line, `L3` is the unhinted control.
+HINT_LEVEL=${HINT_LEVEL:-L1}
+# Built by `prepare/prepare_all.sh`, one directory per (env, category, tier).
+DATA_DIR=${DATA_DIR:-${PSRL_PATH}/examples/sciaccel_rl/data/pluto-cooling-chemistry/repair_easy}
+train_files=${DATA_DIR}/train/${HINT_LEVEL}.parquet
+# Hinted eval matches the training distribution. `L3` is the unhinted control, so its
+# in-distribution eval set IS the unhinted one. Override with VAL_FILES.
+if [ "${HINT_LEVEL}" = "L3" ]; then
+    val_files=${VAL_FILES:-${DATA_DIR}/eval/unhinted.parquet}
+else
+    val_files=${VAL_FILES:-${DATA_DIR}/eval/${HINT_LEVEL}.parquet}
+fi
 
 if [[ ! -d "${HF_MODEL_PATH}" ]]; then
     echo "ERROR: model directory not found: ${HF_MODEL_PATH}" >&2
@@ -33,21 +43,24 @@ fi
 for f in "${train_files}" "${val_files}"; do
     if [[ ! -f "${f}" ]]; then
         echo "ERROR: parquet not found: ${f}" >&2
-        echo "Build it: python -m examples.sciaccel_rl.prepare.build_dataset_v2 --repo <sciaccel-rl> --out-dir $(dirname "${f}")" >&2
+        echo "Build it: bash examples/sciaccel_rl/prepare/prepare_all.sh --repo <sciaccel-rl> --envs <env>" >&2
         exit 1
     fi
 done
 
 # --- Experiment ---
-project_name=sciaccel_rl
-experiment_name=GRPO-sciaccel-v2-Qwen35-4B
+project_name=${PROJECT_NAME:-sciaccel_rl_pluto}
+# `<env>_<category>_<tier>` from the last two path segments, because every env's
+# dataset dir ends in the same `repair_easy` and the basename alone would collide.
+dataset_tag=$(basename "$(dirname "${DATA_DIR}")")_$(basename "${DATA_DIR}")
+experiment_name=GRPO-sciaccel-Qwen35-4B-${dataset_tag}-${HINT_LEVEL}
 OUTPUT_DIR=${OUTPUT_DIR:-${PSRL_PATH}/examples/sciaccel_rl}
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/${project_name}/${experiment_name}
 PSRL_LOG_DIR=${OUTPUT_DIR}/psrl_logs/${experiment_name}
 mkdir -p "${CKPTS_DIR}" "${PSRL_LOG_DIR}"
 
 # --- Agent loop config ---
-agent_loop_config_path=${PSRL_PATH}/examples/sciaccel_rl/config/sciaccel_agent_config_v2.yaml
+agent_loop_config_path=${PSRL_PATH}/examples/sciaccel_rl/config/sciaccel_agent_config.yaml
 reward_path=${PSRL_PATH}/examples/sciaccel_rl/reward.py
 
 # --- Batch and sequence lengths ---
@@ -58,7 +71,10 @@ rollout_N=8
 # Keep prompts large enough for the longest task instruction.
 max_prompt_length=2048
 # Long terminal output requires most of the context budget.
-max_response_length=${MAX_RESPONSE_LENGTH:-81920}
+max_response_length=${MAX_RESPONSE_LENGTH:-65536}
+# NOTE(lhy): Must equal the training budget, never exceed it. This reaches terminus-2
+# as `max_input_tokens`, so any headroom is budget the agent spends, and TITO then
+# hands the trainer a response longer than `max_response_length`.
 max_model_len=$(( max_prompt_length + max_response_length ))
 # The packing budget must cover the longest sequence without exceeding the window.
 max_tokens_per_gpu=${MAX_TOKENS_PER_GPU:-${max_model_len}}
@@ -68,11 +84,21 @@ if (( max_tokens_per_gpu < max_model_len )); then
     exit 1
 fi
 max_num_batched_tokens=${max_model_len}
-# The turn cap lets Harbor grade delivered work before unbounded context growth.
+# Bounded by the response budget, not by taste: at ~1104 response tokens per turn, 50
+# turns already spends 55k of 65536. Raising it needs `max_response_length` raised too.
 max_turns=${MAX_TURNS:-50}
 
-# Spread Harbor containers across nodes with one agent loop worker per node.
-AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-3}
+# Nodes allowed to host agent loop workers, and therefore Docker containers. A node
+# with a degraded daemon accepts actors and then hangs. Empty means every alive node.
+AGENT_NODE_IPS=${AGENT_NODE_IPS:-28.49.55.85,28.49.196.175}
+
+# One worker per allowed node. Placement is round-robin, so more workers than nodes
+# stacks them and multiplies the container count `max_concurrent_episodes` bounds.
+if [ -n "${AGENT_NODE_IPS}" ]; then
+    AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-$(awk -F, '{print NF}' <<< "${AGENT_NODE_IPS}")}
+else
+    AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-3}
+fi
 
 # Bound admitted sequences to the rollout engine's KV capacity.
 # Revisit this value when batch size, context length, or engine count changes.
@@ -83,9 +109,14 @@ SERVER_MAX_CONCURRENCY=${SERVER_MAX_CONCURRENCY:-64}
 
 # --- Chain-of-thought handling across turns ---
 
-# Preserve accumulated thinking bytes across turns with the Qwen3.5 template.
-thinking_template=multi_thinking
-chat_template_path=${PSRL_PATH}/examples/sciaccel_rl/config/qwen35_acc_thinking.jinja2
+# `multi_thinking` needs the accumulating template, so derive the path here.
+thinking_template=${thinking_template:-multi_thinking}
+if [ "${thinking_template}" = "multi_thinking" ]; then
+    chat_template_path=${PSRL_PATH}/examples/sciaccel_rl/config/qwen35_acc_thinking.jinja2
+    chat_template_arg="+gen_actor_rollout_ref.rollout.chat_template=${chat_template_path}"
+else
+    chat_template_arg=""
+fi
 
 # --- Deployment: 3 nodes x 8 GPU = 24 (8 generation + 16 training) ---
 
@@ -116,8 +147,9 @@ VAL_NGPUS_PER_NODE_PER_INSTANCE=$((VAL_TP * VAL_PP))
 
 # --- GRPO and optimizer ---
 actor_lr=1e-6
-use_kl_loss=True
-kl_loss_coef=0.001
+# KL to the reference is off, which also frees the memory the ref model held.
+use_kl_loss=False
+kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.3
 total_training_steps=${TOTAL_TRAINING_STEPS:-200}
@@ -130,16 +162,9 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP:-127.0.0.1} \
     psrl.ps_mode=nixl_cpu \
     psrl.rollout_n=${rollout_N} \
-    `# 1, so rollout for step N+1 overlaps training for step N instead of the GPUs idling` \
-    `# through each phase. It also doubles requests in flight, since max_concurrency is` \
-    `# rollout_n * staleness_buffer_entries * (staleness + 1), which is why the admission gate` \
-    `# above is load-bearing.` \
-    `#` \
-    `# This needs the losses.py width-matching fix: no_padding_2_padding pads the model output` \
-    `# to this micro-batch's own max response length (max_response_len is only set on the` \
-    `# left-right padding path, never on NO_PADDING), while old_log_probs was padded under the` \
-    `# grouping it was stored with. Those groupings only differ once staleness > 0, which is` \
-    `# why step 1 passed and step 2 died on "size of tensor a (273) vs b (337)".` \
+    `# Overlaps rollout for step N+1 with training for step N. Requests in flight are` \
+    `# rollout_n * staleness_buffer_entries * (staleness + 1), which is what the admission` \
+    `# gate above bounds.` \
     psrl.staleness=${STALENESS:-1} \
     psrl.staleness_buffer_entries=${train_batch_size} \
     psrl.rollout_gateway.trajectory_id_strategy=auto \
@@ -160,16 +185,9 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
-    `# DAPO-style dynamic sampling is OFF by default. It drops groups whose rewards are all` \
-    `# identical, which under GRPO contribute exactly nothing (advantage is reward minus group` \
-    `# mean over std, so zero variance means zero gradient). The step-1 timing argues FOR it --` \
-    `# update_actor was 2069 s of a 3210 s step, 64%, while rollout was only 751 s, 23% -- so` \
-    `# trading rollout for less training is the right direction on paper.` \
-    `#` \
-    `# The risk is that it never fills a batch: the measured per-episode solve rate is 5.7%` \
-    `# (40 of 704), so P(all 8 rollouts identical) is 0.63 and only ~37% of groups survive,` \
-    `# needing ~2.7x more rollout per step. Enable with GROUP_FILTER=True once a baseline is` \
-    `# established, and watch that the buffer still reaches its group count.` \
+    `# Drops zero-variance GRPO groups, which contribute no gradient. Off by default` \
+    `# because the measured 5.7% solve rate leaves only ~37% of groups surviving, so it` \
+    `# needs ~2.7x more rollout per step to fill a batch.` \
     psrl.group_post_process.enable=${GROUP_FILTER:-False} \
     psrl.group_post_process.name=dynamic_sampling_filter \
     algorithm.filter_groups.metric=seq_final_reward \
@@ -181,7 +199,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     gen_actor_rollout_ref.rollout.max_model_len=${max_model_len} \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
-    +gen_actor_rollout_ref.rollout.chat_template=${chat_template_path} \
+    ${chat_template_arg} \
     gen_actor_rollout_ref.rollout.n=${rollout_N} \
     gen_actor_rollout_ref.rollout.temperature=1.0 \
     gen_actor_rollout_ref.rollout.top_p=1.0 \
@@ -191,11 +209,20 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     gen_actor_rollout_ref.rollout.agent.default_agent_loop=sciaccel \
     gen_actor_rollout_ref.rollout.agent.num_workers=${AGENT_LOOP_WORKERS} \
+    `# Restrict which nodes host agent loop workers, and therefore Docker containers.` \
+    `# Set AGENT_NODE_IPS='' to fall back to every alive node.` \
+    ${AGENT_NODE_IPS:+gen_actor_rollout_ref.rollout.agent.node_ips=[${AGENT_NODE_IPS}]} \
     gen_actor_rollout_ref.rollout.agent.traj_reward_mode=traj \
+    `# Masks budget-truncated episodes out of the gradient while keeping their reward in` \
+    `# the GRPO baseline. Without it, token-mean rewards shorter turns, which spends the` \
+    `# turn cap faster and collapses the score.` \
+    gen_actor_rollout_ref.rollout.agent.overlong_filtering=${OVERLONG_FILTERING:-True} \
     \
     train_actor_rollout_ref.model.path=${HF_MODEL_PATH} \
     train_actor_rollout_ref.actor.optim.lr=${actor_lr} \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    `# Short, because these runs are tens of steps long and a 10-step warmup leaves the` \
+    `# reward curve as mostly sampling noise.` \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=${LR_WARMUP_STEPS:-3} \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_batch_size} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -211,28 +238,14 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.actor.grad_clip=1.0 \
     train_actor_rollout_ref.actor.strategy=fsdp2 \
     train_actor_rollout_ref.actor.fsdp_config.fsdp_size=${TRAIN_FSDP} \
-    `# Optimizer offload is back ON, which is also what validate_config wants unless TMS` \
-    `# covers the training workers. It used to be incompatible with the fused log-prob kernel:` \
-    `# with offload the lm_head is a DTensor whose local shard lives on CPU, full_tensor()` \
-    `# returns a CPU tensor, and qwen3_5.py only converted the activations dtype, so the` \
-    `# matmul died with "mat2 is on cpu, different from other tensors on cuda:0". That is now` \
-    `# fixed at the source: qwen3_5.py moves the weights to the activations device first, so` \
-    `# this path no longer depends on the offload setting either way.` \
+    `# Required by validate_config unless TMS covers the training workers.` \
     train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    `# Chunked log-prob computation, needed IN ADDITION to SP. SP shards activations through` \
-    `# the layer stack, but the engine gathers before the head, so lm_head still sees the full` \
-    `# sequence: with SP=8 and this off, the OOM was 43.53 GiB, which reverses to 94,112 tokens` \
-    `# rather than the sharded 12,288. Qwen3.5's vocab is 248,320, so the unfused logits are` \
-    `# 45.5 GiB bf16 / 90.9 GiB after the fp32 upcast for log_softmax, while this path chunks` \
-    `# and peaks at 10.8 GiB (measured at the full 98,304 budget).` \
-    `#` \
-    `# It needs monkey_patch.py's embeds slice to use padding=True so the shard's token count` \
-    `# matches the engine's padded labels, which is fixed there.` \
+    `# Chunks the log-prob computation, and is needed IN ADDITION to SP: the engine gathers` \
+    `# before the head, so lm_head sees the full sequence. Unfused logits over Qwen3.5's` \
+    `# 248,320 vocab are 45.5 GiB bf16, against 10.8 GiB chunked.` \
     train_actor_rollout_ref.model.use_fused_kernels=True \
     train_actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
-    `# Sequence parallelism. See the TRAIN_SP definition above: this is the lever that shards` \
-    `# activations for a ~98k-token packed sequence, and it needed the text-only fix in` \
-    `# transformer_impl.py to work on a multimodal checkpoint.` \
+    `# Shards activations for a ~98k-token packed sequence. See TRAIN_SP above.` \
     train_actor_rollout_ref.actor.ulysses_sequence_parallel_size=${TRAIN_SP} \
     +train_actor_rollout_ref.actor.use_rollout_log_probs=True \
     \
@@ -250,13 +263,18 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     reward.active_managers='[dapo]' \
     reward.managers.dapo.reward_fn.0.path=${reward_path} \
     reward.managers.dapo.reward_fn.0.name=compute_score \
+    `# Off, because length here is a symptom of failing to localize the defect rather than` \
+    `# a cause worth shaping, and penalising it mostly re-punishes already-failing episodes.` \
     reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.enable=False \
-    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.len=${max_response_length} \
     reward.managers.dapo.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files=${train_files} \
     data.val_files=${val_files} \
     data.train_batch_size=${train_batch_size} \
+    `# The bank is grouped by category on disk, and verl defaults this to False, so an` \
+    `# unshuffled run spends its first steps inside a single category.` \
+    data.shuffle=True \
+    data.seed=${DATA_SEED:-1} \
     data.prompt_key=prompt \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
@@ -268,14 +286,11 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
-    algorithm.norm_adv_by_std_in_grpo=True \
-    `# Truncated importance sampling, matching the dapo_trainer convention (rollout_is=token,` \
-    `# threshold 2.0). This is load-bearing rather than optional here because staleness=1` \
-    `# means a step trains on trajectories generated by the PREVIOUS weights, so the rollout` \
-    `# and training policies genuinely differ and the uncorrected gradient is biased. TIS` \
-    `# reweights per token by the behaviour-vs-current ratio, clipped at 2.0 so a few` \
-    `# high-ratio tokens cannot dominate an update. It consumes the rollout log-probs that` \
-    `# use_rollout_log_probs and enable_rollout_engine_log_prob already produce.` \
+    `# Dr. GRPO: center advantages within the group, do NOT divide by the group std.` \
+    `# Dividing amplifies noise in near-degenerate groups, and this task is close to bimodal.` \
+    algorithm.norm_adv_by_std_in_grpo=False \
+    `# TIS, matching the dapo_trainer convention. Load-bearing rather than optional because` \
+    `# staleness=1 means the rollout and training policies genuinely differ.` \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.rollout_correction.rollout_is_threshold=2.0 \
     trainer.critic_warmup=0 \

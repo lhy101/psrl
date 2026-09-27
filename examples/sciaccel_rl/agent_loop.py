@@ -28,10 +28,9 @@ class _HarborLoopThread:
     """
     A single dedicated thread running its own asyncio event loop for Harbor Jobs.
 
-    Harbor uses asyncio.subprocess internally. Running multiple asyncio.run()
-    from separate threads causes "Racing with another loop to spawn a process"
-    errors. This class provides one shared event loop that serializes subprocess
-    creation while still allowing concurrent Harbor I/O (network waits etc.).
+    Harbor uses `asyncio.subprocess` internally, and concurrent `asyncio.run()` from
+    separate threads races on process spawn. One shared loop serializes that while
+    still allowing concurrent Harbor I/O.
     """
 
     def __init__(self):
@@ -56,13 +55,40 @@ class _HarborLoopThread:
 
 _harbor_loop = _HarborLoopThread()
 
+# Admission gate on concurrent Harbor episodes, created lazily on the Harbor loop
+# because an `asyncio.Semaphore` binds to the loop that first awaits it.
+_episode_gate: asyncio.Semaphore | None = None
+_episode_gate_limit = 0
+
+
+async def _acquire_episode_slot(limit: int) -> asyncio.Semaphore:
+    """
+    Return the shared episode gate, building it on first use.
+
+    Runs on the Harbor loop, so no lock is needed: that loop is single threaded and
+    this coroutine does not await before the assignment.
+
+    Args:
+        limit (int): Maximum concurrent episodes for this worker.
+
+    Returns:
+        asyncio.Semaphore: The gate, already acquired by the caller.
+    """
+    global _episode_gate, _episode_gate_limit
+    if _episode_gate is None or _episode_gate_limit != limit:
+        _episode_gate = asyncio.Semaphore(limit)
+        _episode_gate_limit = limit
+        psrl_logger.info("Harbor episode concurrency capped at %d per worker.", limit)
+    await _episode_gate.acquire()
+    return _episode_gate
+
 
 @register("sciaccel")
 class SciAccelAgentLoop(SessionAgentLoop):
     """
     Harbor-based episode runner for SciAccel-RL tasks.
 
-    Each call to ``run()`` launches one Harbor Job (agent + verifier containers)
+    Each call to `run()` launches one Harbor Job (agent + verifier containers)
     with the model endpoint pointed at this session's TITO URL, then assembles
     the training data from TITO and the reward from the verifier.
     """
@@ -100,6 +126,8 @@ class SciAccelAgentLoop(SessionAgentLoop):
 
         task_path = extra_info.get("task_path", "")
         reward_key = extra_info.get("reward_key", "reward")
+        hint = extra_info.get("hint", "")
+        guidance = extra_info.get("guidance", "")
         needs_gpu = int(extra_info.get("gpus", 0)) > 0
         uid = request.get("uid", "?")
 
@@ -126,6 +154,8 @@ class SciAccelAgentLoop(SessionAgentLoop):
                 model_name,
                 needs_gpu=needs_gpu,
                 session_id=session_id,
+                hint=hint,
+                guidance=guidance,
             )
 
             if harbor_result.exception:
@@ -208,6 +238,17 @@ class SciAccelAgentLoop(SessionAgentLoop):
                 terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
             elif num_turns >= self.max_turns:
                 terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
+            elif harbor_result.exception and not harbor_result.rewards:
+                # NOTE(lhy): An infrastructure failure leaves the reward dict empty, which
+                # `reward.py` cannot tell from a graded 0.0. Reporting FINISHED would split
+                # siblings of one task 0.0 against 1.0 on container luck alone.
+                terminate_reason = TerminateReason.VERIFIER_ERROR
+                psrl_logger.warning(
+                    "[uid=%s] Verifier produced no reward (%s), reporting verifier_error "
+                    "so the ungraded trajectory does not train as a real zero.",
+                    uid,
+                    harbor_result.exception_type or "unknown",
+                )
 
             psrl_logger.info(
                 "[uid=%s] Episode done: terminate=%s, reward=%.3f.",
@@ -240,11 +281,8 @@ class SciAccelAgentLoop(SessionAgentLoop):
         """
         Attempt to recover partial training data from TITO after timeout/error.
 
-        Even if Harbor timed out, the LLM turns captured by TITO before the
-        timeout are valid training data. No verifier score exists on this path
-        (the exception escaped before Harbor returned a result), so the reward
-        is 0 -- unlike the overflow path in `run`, which forwards whatever the
-        verifier produced.
+        Turns captured by TITO before the timeout are valid training data. No verifier
+        score exists on this path, so the reward is 0.
         """
         if session_id is None:
             return None, TerminateReason.ROLLOUT_ERROR
@@ -291,26 +329,38 @@ class SciAccelAgentLoop(SessionAgentLoop):
         *,
         needs_gpu: bool = False,
         session_id: str = "",
+        hint: str = "",
+        guidance: str = "",
     ) -> HarborEpisodeResult:
         """
         Run the Harbor Job on the dedicated Harbor event loop thread.
 
-        All Harbor Jobs share a single event loop to avoid subprocess race
-        conditions (Harbor uses asyncio.subprocess internally).
+        All Harbor Jobs share one event loop to avoid `asyncio.subprocess` races. The
+        episode is admitted through a semaphore released only after `run_harbor_episode`
+        tears its containers down, so a waiting episode starts against a clean daemon.
         """
-        future = _harbor_loop.run(
-            run_harbor_episode(
-                task_path=task_path,
-                model_base_url=model_base_url,
-                model_name=model_name,
-                config=self.runtime_config,
-                needs_gpu=needs_gpu,
-                session_id=session_id,
-                max_model_len=int(self.rollout_config.get("max_model_len", 40960)),
-                max_turns=self.max_turns,
-                actor_id=os.getenv("PSRL_ACTOR_ID", ""),
-                thinking_template=self.thinking_template,
-            )
-        )
+        limit = int(self.runtime_config.harbor.max_concurrent_episodes)
+
+        async def _gated() -> HarborEpisodeResult:
+            gate = await _acquire_episode_slot(limit)
+            try:
+                return await run_harbor_episode(
+                    task_path=task_path,
+                    model_base_url=model_base_url,
+                    model_name=model_name,
+                    config=self.runtime_config,
+                    needs_gpu=needs_gpu,
+                    session_id=session_id,
+                    max_model_len=int(self.rollout_config.get("max_model_len", 40960)),
+                    max_turns=self.max_turns,
+                    actor_id=os.getenv("PSRL_ACTOR_ID", ""),
+                    thinking_template=self.thinking_template,
+                    hint=hint,
+                    guidance=guidance,
+                )
+            finally:
+                gate.release()
+
+        future = _harbor_loop.run(_gated())
         # Harbor owns the timeout budget. Another deadline could discard valid slow episodes.
         return await asyncio.wrap_future(future)
