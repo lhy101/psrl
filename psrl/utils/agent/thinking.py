@@ -2,6 +2,12 @@
 
 TITO hashes `reasoning_content` into each trajectory. Harnesses that omit it
 during replay can fork a new trajectory on every turn.
+
+The first four modes assume PSRL serves the model, so SMG and a local chat
+template are both available. HOSTED_INLINE covers the case where neither is: a
+third-party endpoint owns its template and runs no TITO, and a reasoning model
+there answers in `reasoning_content` with `content` empty, leaving an agent
+harness reading nothing at all.
 """
 
 from __future__ import annotations
@@ -18,14 +24,18 @@ MULTI_THINKING = "multi_thinking"
 # Turn thinking off entirely. No CoT to split, so nothing forks.
 DISABLE_THINKING = "disable_thinking"
 
-SUPPORTED_THINKING_TEMPLATES = frozenset({MULTI_TRAJ, LONGEST_TRAJ, MULTI_THINKING, DISABLE_THINKING})
+# Ask a hosted endpoint to inline its reasoning and to stop thinking, with no
+# local chat template to accumulate into.
+HOSTED_INLINE = "hosted_inline"
+
+SUPPORTED_THINKING_TEMPLATES = frozenset({MULTI_TRAJ, LONGEST_TRAJ, MULTI_THINKING, DISABLE_THINKING, HOSTED_INLINE})
 
 # Modes that require the gateway's reasoning parser to stay OFF so the full
 # generated text, the model's own `</think>` included, arrives inline in `content`.
-_INLINE_REASONING_MODES = frozenset({MULTI_THINKING})
+_INLINE_REASONING_MODES = frozenset({MULTI_THINKING, HOSTED_INLINE})
 
 # Modes that require the model's thinking toggle to be OFF.
-_THINKING_DISABLED_MODES = frozenset({DISABLE_THINKING})
+_THINKING_DISABLED_MODES = frozenset({DISABLE_THINKING, HOSTED_INLINE})
 
 
 def validate_thinking_template(mode: str) -> str:
@@ -53,7 +63,11 @@ def wants_thinking_disabled(mode: str) -> bool:
 
 
 def requires_accumulating_template(mode: str) -> bool:
-    """Whether ``mode`` needs a chat template that replays prior `<think>` blocks."""
+    """Whether ``mode`` needs a chat template that replays prior `<think>` blocks.
+
+    HOSTED_INLINE is excluded deliberately: a hosted endpoint renders with its own
+    template, so there is no local file to point at and nothing to accumulate.
+    """
     return validate_thinking_template(mode) == MULTI_THINKING
 
 
@@ -132,6 +146,7 @@ __all__ = [
     "LONGEST_TRAJ",
     "MULTI_THINKING",
     "DISABLE_THINKING",
+    "HOSTED_INLINE",
     "SUPPORTED_THINKING_TEMPLATES",
     "validate_thinking_template",
     "keeps_longest_trajectory_only",
