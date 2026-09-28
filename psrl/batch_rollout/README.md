@@ -28,16 +28,24 @@ A worked recipe lives in `examples/sciaccel_rl/batch_rollout_qwen35_4b.sh`.
 
 ## Layout
 
+This package holds what is specific to collection:
+
 | File | Role |
 |------|------|
 | `main_batch_rollout.py` | Hydra entry point and `BatchRolloutTaskRunner`. |
-| `worker.py` | `BatchRolloutAgentLoopWorker`: runs episodes, records results. |
-| `manager.py` | `BatchRolloutAgentLoopManager`: round-robin dispatch, bounded queue. |
-| `data.py` | `BatchRolloutDataProcessor`: streams the dataset once. |
 | `output_writer.py` | `RolloutOutputWriter`: append-only `rollout.jsonl` plus resume. |
 | `record.py` | Builds one JSON record per trajectory. |
 | `serving/` | Serving backends. `base.py` holds the ABC and the factory. |
 | `config/` | Hydra groups. `batch_rollout.yaml` is the thin root. |
+
+The agent-loop and dataset subclasses live beside their RL siblings, because
+that is where the base class and the role convention already are:
+
+| File | Role |
+|------|------|
+| `workers/agent_loop/batch_rollout_worker.py` | `BatchRolloutAgentLoopWorker`: runs episodes, records results. |
+| `workers/agent_loop/batch_rollout_manager.py` | `BatchRolloutAgentLoopManager`: round-robin dispatch, bounded queue. |
+| `utils/dataset/batch_rollout_data_processor.py` | `BatchRolloutDataProcessor`: streams the dataset once. |
 
 What is reused rather than reimplemented: `AgentLoopWorkerBase` and
 `AgentLoopManagerBase` (shared with RL), `DataProcessorBase`, `TrajectoryWriter`,

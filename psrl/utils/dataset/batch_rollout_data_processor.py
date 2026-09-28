@@ -6,8 +6,7 @@ import os
 import ray
 from verl.utils import tensordict_utils as tu
 
-from psrl.utils.dataset import DatasetType
-from psrl.utils.dataset.data_processor import DataProcessorBase
+from psrl.utils.dataset.data_processor import DataProcessorBase, DatasetType
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
