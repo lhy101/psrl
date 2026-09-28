@@ -21,12 +21,12 @@ import ray
 from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from psrl.batch_rollout.data import BatchRolloutDataProcessor
-from psrl.batch_rollout.manager import BatchRolloutAgentLoopManager
 from psrl.batch_rollout.output_writer import RolloutOutputWriter
 from psrl.batch_rollout.serving.base import build_serving_backend
-from psrl.batch_rollout.worker import BatchRolloutAgentLoopWorker
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from psrl.utils.dataset.batch_rollout_data_processor import BatchRolloutDataProcessor
+from psrl.workers.agent_loop.batch_rollout_manager import BatchRolloutAgentLoopManager
+from psrl.workers.agent_loop.batch_rollout_worker import BatchRolloutAgentLoopWorker
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

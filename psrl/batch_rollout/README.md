@@ -28,16 +28,24 @@ A worked recipe lives in `examples/sciaccel_rl/batch_rollout_qwen35_4b.sh`.
 
 ## Layout
 
+This package holds what is specific to collection:
+
 | File | Role |
 |------|------|
 | `main_batch_rollout.py` | Hydra entry point and `BatchRolloutTaskRunner`. |
-| `worker.py` | `BatchRolloutAgentLoopWorker`: runs episodes, records results. |
-| `manager.py` | `BatchRolloutAgentLoopManager`: round-robin dispatch, bounded queue. |
-| `data.py` | `BatchRolloutDataProcessor`: streams the dataset once. |
 | `output_writer.py` | `RolloutOutputWriter`: append-only `rollout.jsonl` plus resume. |
 | `record.py` | Builds one JSON record per trajectory. |
 | `serving/` | Serving backends. `base.py` holds the ABC and the factory. |
 | `config/` | Hydra groups. `batch_rollout.yaml` is the thin root. |
+
+The agent-loop and dataset subclasses live beside their RL siblings, because
+that is where the base class and the role convention already are:
+
+| File | Role |
+|------|------|
+| `workers/agent_loop/batch_rollout_worker.py` | `BatchRolloutAgentLoopWorker`: runs episodes, records results. |
+| `workers/agent_loop/batch_rollout_manager.py` | `BatchRolloutAgentLoopManager`: round-robin dispatch, bounded queue. |
+| `utils/dataset/batch_rollout_data_processor.py` | `BatchRolloutDataProcessor`: streams the dataset once. |
 
 What is reused rather than reimplemented: `AgentLoopWorkerBase` and
 `AgentLoopManagerBase` (shared with RL), `DataProcessorBase`, `TrajectoryWriter`,
@@ -160,11 +168,11 @@ unchanged. `summary.json` records all three so a later reader can check.
 - **A failed episode is recorded, not dropped.** Check the `terminate_reason`
   histogram in `summary.json`: a run dominated by `rollout_error` completed
   without producing usable data.
-- **Use `thinking_template=hosted_inline` on `openai_api`.** A reasoning model
-  behind a third-party endpoint answers in `reasoning_content` and leaves
-  `content` empty, which an agent harness reads as an empty reply. The TITO modes
-  (`multi_traj`, `longest_traj`) shape no request and cannot prevent it, and
-  `multi_thinking` needs a local chat template the provider will never use.
+- **`thinking_template` cannot control a hosted endpoint.** Its knobs are SMG and
+  vLLM conventions that a third-party gateway drops silently. A reasoning model
+  there may answer in `reasoning_content` and leave `content` empty, which an
+  agent harness reads as an empty reply. Nothing in the config fixes that, so
+  pick a model that fills `content` and check a transcript on a new endpoint.
 - **`dump_tokens` is inert on `openai_api`.** The warning in the log is the only
   signal, because no token field is written at all.
 - **A PS-free replica must not be given a PSManager handle.** It would start on

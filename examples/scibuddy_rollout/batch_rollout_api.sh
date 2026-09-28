@@ -45,6 +45,9 @@ max_in_flight_per_worker=${max_in_flight_per_worker:-1}
 max_model_len=${max_model_len:-32768}
 max_turns=${max_turns:-30}
 
+# Trajectory-retention policy. See psrl/utils/agent/thinking.py.
+thinking_template=${thinking_template:-multi_traj}
+
 output_dir=${output_dir:-outputs/scibuddy_api_$(date +%Y%m%d_%H%M%S)}
 case "$output_dir" in /*) ;; *) output_dir="$ROOT/$output_dir" ;; esac
 
@@ -55,8 +58,8 @@ echo "  key from: \$$api_key_env"
 echo "  output:   $output_dir"
 echo ""
 
-# `hosted_inline` is required: a reasoning model behind a third-party endpoint
-# answers in `reasoning_content`, which an agent harness reads as empty.
+# A hosted endpoint ignores the CoT knobs, so this only selects the retention
+# policy. Whether `content` arrives non-empty is the model's behavior, not ours.
 PYTHONUNBUFFERED=1 python -m psrl.batch_rollout.main_batch_rollout \
   serving=openai_api \
   batch_rollout.serving.api_base_url="$api_base_url" \
@@ -82,7 +85,7 @@ PYTHONUNBUFFERED=1 python -m psrl.batch_rollout.main_batch_rollout \
   gen_actor_rollout_ref.rollout.agent.agent_loop_config_path="$ROOT/examples/scibuddy_rollout/config/scibuddy_agent_config.yaml" \
   gen_actor_rollout_ref.rollout.agent.default_agent_loop=scibuddy \
   ${node_ips:+gen_actor_rollout_ref.rollout.agent.node_ips="$node_ips"} \
-  psrl.agentic_rl.thinking_template=hosted_inline \
+  psrl.agentic_rl.thinking_template="$thinking_template" \
   psrl.logging_path="$output_dir/logs"
 
 echo ""

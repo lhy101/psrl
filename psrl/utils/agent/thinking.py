@@ -3,11 +3,9 @@
 TITO hashes `reasoning_content` into each trajectory. Harnesses that omit it
 during replay can fork a new trajectory on every turn.
 
-The first four modes assume PSRL serves the model, so SMG and a local chat
-template are both available. HOSTED_INLINE covers the case where neither is: a
-third-party endpoint owns its template and runs no TITO, and a reasoning model
-there answers in `reasoning_content` with `content` empty, leaving an agent
-harness reading nothing at all.
+Every mode here shapes a request to PSRL's own gateway, which is also what makes
+them inert against a third-party endpoint: that endpoint owns its chat template
+and silently drops fields it does not recognise.
 """
 
 from __future__ import annotations

@@ -118,24 +118,6 @@ If the images are not pre-loaded, Docker build returns exit 17 with a 403 from
 the corp mirror. The episode fails with an exception but no rollout_error
 propagates to the output writer.
 
-## Synthetic base image
-
-The synthetic task builds `FROM scibuddy-synth-cpu:1.0`, a tiny CPU image whose
-definition lives at `synthetic_data/base-image/Dockerfile`. Build it once on
-every Harbor node before running the smoke test:
-
-```bash
-docker build -t scibuddy-synth-cpu:1.0     examples/scibuddy_rollout/synthetic_data/base-image
-```
-
-On a rootless daemon whose registry mirror is slow (e.g. the A800 nodes), force
-the legacy builder so the locally cached `debian:bookworm-slim` base is reused
-instead of being re-resolved from the mirror, which otherwise times out:
-
-```bash
-DOCKER_BUILDKIT=0 docker build -t scibuddy-synth-cpu:1.0     examples/scibuddy_rollout/synthetic_data/base-image
-```
-
 ## Results
 
 A synthetic task in the same package format is included, so the integration can
@@ -188,7 +170,7 @@ Model capability shows up in the reply fields too: 120b filled `content` on all
 | Task type | Code repair (inject + fix) | Research analysis (data + JSON output) |
 | GPU | Optional (CPU tasks common) | CPU-only |
 | Reward contract | Multi-key dict (`reward_repair`, `equivalence_pass`, ...) | Scalar `reward` (0 or 1) |
-| Thinking template | `multi_traj` (TITO with forking) | `multi_traj` on smg_local, `hosted_inline` on openai_api |
+| Thinking template | `multi_traj` (TITO with forking) | `multi_traj`, and inert on openai_api |
 | Max turns | 40 | 200 (analysis tasks run longer) |
 | Task timeout | 2700 s | 28800 s (8 hours) |
 

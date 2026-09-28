@@ -94,9 +94,9 @@ from psrl.utils.post_processor import (
 )
 from psrl.utils.server.command import Command, CommandType
 from psrl.utils.transferqueue_utils import PayloadState, clear_payload
-from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
-from psrl.workers.agent_loop.worker import PSRL_AgentLoopWorker
+from psrl.workers.agent_loop.psrl_manager import PSRL_AgentLoopManager
+from psrl.workers.agent_loop.psrl_worker import PSRL_AgentLoopWorker
 from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.gen.rollout_coordination import RolloutCoordinator
 from psrl.workers.gen.rollout_gateway import RolloutGateway

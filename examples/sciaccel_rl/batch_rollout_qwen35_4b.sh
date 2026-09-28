@@ -97,9 +97,9 @@ fi
 # the agent config, which is what actually bounds containers.
 MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-4}
 
-# How chain-of-thought carries across turns. `hosted_inline` suits a third-party
-# endpoint, which owns its chat template and runs no TITO.
-thinking_template=${thinking_template:-hosted_inline}
+# How chain-of-thought carries across turns. A hosted endpoint ignores these
+# knobs, so on that path this only selects the retention policy.
+thinking_template=${thinking_template:-multi_traj}
 if [ "${thinking_template}" = "multi_thinking" ]; then
     chat_template_path=${PSRL_PATH}/examples/sciaccel_rl/config/qwen35_acc_thinking.jinja2
     chat_template_arg="+gen_actor_rollout_ref.rollout.chat_template=${chat_template_path}"
