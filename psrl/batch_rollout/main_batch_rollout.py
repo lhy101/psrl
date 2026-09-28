@@ -99,6 +99,18 @@ def run_batch_rollout(config) -> dict:
             env_vars = ray_init_kwargs["runtime_env"].setdefault("env_vars", {})
             env_vars[api_key_env] = os.environ[api_key_env]
 
+        # PATCH(lhy): Harbor runs inside Ray worker actors, which inherit
+        # the env from `ray start`, not this driver process. The no-network
+        # gate (HARBOR_DOCKER_STATIC_NO_NETWORK=1) that swaps the NET_RAW
+        # egress sidecar for capability-free `network_mode: none` must
+        # therefore travel into the workers explicitly, or rootless daemons
+        # reject the sidecar.
+        _fwd = ray_init_kwargs["runtime_env"].setdefault("env_vars", {})
+        for _k in ("HARBOR_DOCKER_STATIC_NO_NETWORK", "OPENAI_API_KEY", "NO_PROXY", "no_proxy"):
+            _v = os.environ.get(_k)
+            if _v is not None and _k not in _fwd:
+                _fwd[_k] = _v
+
         ray.init(**ray_init_kwargs)
 
     runner = BatchRolloutTaskRunner.remote()

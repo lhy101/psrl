@@ -118,6 +118,24 @@ If the images are not pre-loaded, Docker build returns exit 17 with a 403 from
 the corp mirror. The episode fails with an exception but no rollout_error
 propagates to the output writer.
 
+## Synthetic base image
+
+The synthetic task builds `FROM scibuddy-synth-cpu:1.0`, a tiny CPU image whose
+definition lives at `synthetic_data/base-image/Dockerfile`. Build it once on
+every Harbor node before running the smoke test:
+
+```bash
+docker build -t scibuddy-synth-cpu:1.0     examples/scibuddy_rollout/synthetic_data/base-image
+```
+
+On a rootless daemon whose registry mirror is slow (e.g. the A800 nodes), force
+the legacy builder so the locally cached `debian:bookworm-slim` base is reused
+instead of being re-resolved from the mirror, which otherwise times out:
+
+```bash
+DOCKER_BUILDKIT=0 docker build -t scibuddy-synth-cpu:1.0     examples/scibuddy_rollout/synthetic_data/base-image
+```
+
 ## Results
 
 A synthetic task in the same package format is included, so the integration can
