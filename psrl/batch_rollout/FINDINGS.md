@@ -72,3 +72,32 @@ for f in sorted(glob.glob('<output_dir>/transcripts/*.json')):
 `examples/sciaccel_rl/novita_models.json` records which models one key could
 reach, with prices. Probe with a 1-token request per model, because a catalog
 lists far more than a key is entitled to.
+
+## Concurrency is bounded by CPU, not disk
+
+Container layers are shared read-only, so N containers of one image do not cost
+N times the image. Measured on a 384-core node: 24 containers of a 176 MB image
+consumed 10 MB of disk in total, about 0.4 MB each, because only writes land in
+the writable layer.
+
+Idle containers are close to free. 128 of them held start latency flat at about
+0.4 s and `docker ps` at 0.02 s. CPU-bound ones are what cost: 64 running a busy
+numpy loop drove load to 58 of 384 cores, still fully responsive.
+
+So size `max_concurrent_episodes` against cores and the task's own `cpus`
+declaration, not against disk. One episode holds one agent container, and then
+one verifier container after it under `environment_mode = "separate"`.
+
+## Resource limits fail in three different ways
+
+| Limit | Exceeded | Consequence |
+|---|---|---|
+| `mem_limit` | Kernel OOM-kills the container, exit 137, `OOMKilled: true` | A solver that briefly peaks dies mid-run and the verifier sees no output |
+| `cpus` | Throttled to the ceiling, never killed | The task just takes longer, so a tight agent timeout turns into a spurious failure |
+| writable layer | Not capped at all | A runaway write fills the shared docker filesystem for every other container |
+
+`--storage-opt size` is rejected under `fuse-overlayfs`, so a per-container disk
+quota is unavailable on this driver. Bound writes through the task itself.
+
+Memory is the dangerous one: it is a hard ceiling, so set it above the real peak
+or leave `memory_mb_override` at 0 and trust the task declaration.

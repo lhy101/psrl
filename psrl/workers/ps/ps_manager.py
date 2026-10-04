@@ -875,15 +875,7 @@ class PSManager(RequestStatusTracker):
             )
 
             if self.rollout_instance_tracker[rollout_instance_id].version_tag != self.model_store.version_tag:
-                # NOTE(lhy): The coordinator is unnecessary when initialization keeps the version at zero.
-                assert self.rollout_coordinator is not None, (
-                    "Rollout coordinator is not set. Please set it before updating rollout instance model version."
-                )
                 self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
-                self.rollout_coordinator.set_rollout_instance_model_version.remote(
-                    rollout_instance_id=rollout_instance_id,
-                    version_tag=self.model_store.version_tag,
-                )
                 psrl_logger.info(
                     f"Updated rollout instance: {rollout_instance_id}. Model version: {self.model_store.version_tag}."
                 )

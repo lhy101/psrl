@@ -1415,14 +1415,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 )
         return curr_model_version
 
-    async def sync_with_ps(self, ps_version: int, pause_generation: bool = False):
-        if pause_generation:
-            await self.pause_for_sync()
-        version = await self.pull_model_for_sync(ps_version)
-        if pause_generation:
-            await self.resume_after_sync()
-        return version
-
     async def pull_model(self):
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             await self.ray_pull_model()

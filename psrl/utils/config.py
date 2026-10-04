@@ -487,4 +487,50 @@ def validate_config(
                 f"got {env_worker_config.cpu_slots_per_worker!r}."
             )
 
+    _resolve_rollout_max_model_len(config)
+
     print("[validate_config] All configuration checks passed successfully!")
+
+
+def _resolve_rollout_max_model_len(config: DictConfig) -> None:
+    """Default every rollout's `max_model_len` to the recipe's own token budget.
+
+    `data.max_prompt_length + data.max_response_length` is the context a recipe
+    asks for, and vLLM stops a sequence at `num_tokens >= max_model_len` counting
+    prompt plus output. Left unset, verl falls back to the model's
+    `max_position_embeddings`, which for an 8B Qwen3 is 40960 against a budget of
+    11264, so the recipe's limit is never enforced.
+
+    Single-turn generation does not notice: one dispatch gets
+    `max_tokens = response_length + prompt_length - prompt_len`, and vLLM's other
+    stop condition caps the total at exactly the budget. A trajectory split across
+    segments does notice. Partial rollout re-dispatches the continuation with the
+    accumulated output folded into its prompt and a fresh `max_tokens` sized from
+    the original prompt, so `max_tokens` no longer bounds the total and
+    `max_model_len` is the only remaining guard.
+
+    An explicit value is kept and only checked for being large enough to hold one
+    exchange. A multi-turn recipe legitimately sets a window wider than that,
+    because its budget spans turns; anything smaller would truncate generation the
+    recipe asked for.
+    """
+    budget = int(config.data.max_prompt_length) + int(config.data.max_response_length)
+    for name in ("gen_actor_rollout_ref", "train_actor_rollout_ref"):
+        section = config.get(name)
+        if section is None or section.get("rollout") is None:
+            continue
+        configured = section.rollout.get("max_model_len")
+        if configured is None:
+            section.rollout.max_model_len = budget
+            print(
+                f"[validate_config] {name}.rollout.max_model_len was unset, "
+                f"defaulting to data.max_prompt_length + data.max_response_length "
+                f"= {budget}."
+            )
+        elif int(configured) < budget:
+            raise ValueError(
+                f"{name}.rollout.max_model_len={int(configured)} is smaller than "
+                f"data.max_prompt_length + data.max_response_length={budget}, so a "
+                f"single exchange cannot fit and generation would be truncated "
+                f"below what the recipe asks for."
+            )

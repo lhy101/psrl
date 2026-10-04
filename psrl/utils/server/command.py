@@ -12,24 +12,12 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 class CommandType(Enum):
     """
     Enum for different command types used in the server.
-    STOP: Stop the server.
-    RESUME: Resume the server.
-    SHUTDOWN: Shutdown the server gracefully.
-    SYNC: Synchronize the server state with the latest weights.
     ABORT: Abort requests running in the server.
-    CHECK_AND_SYNC: Check if the server needs to sync with the latest weights and do so if necessary.
-    ENGINE_STATUS: Send engine status information.
     SLEEP: Sleep the server.
     WAKE_UP: Wake up the server.
     """
 
-    STOP = enum.auto()
-    RESUME = enum.auto()
-    SHUTDOWN = enum.auto()
-    SYNC = enum.auto()
     ABORT = enum.auto()
-    CHECK_AND_SYNC = enum.auto()
-    ENGINE_STATUS = enum.auto()
     SLEEP = enum.auto()
     WAKE_UP = enum.auto()
 

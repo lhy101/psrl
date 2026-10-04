@@ -1,4 +1,4 @@
-"""CommandHandlerMixin: periodic background loop for ABORT/SYNC/SLEEP/WAKE_UP commands."""
+"""CommandHandlerMixin: periodic background loop for ABORT/SLEEP/WAKE_UP commands."""
 
 from __future__ import annotations
 
@@ -29,7 +29,8 @@ class CommandHandlerMixin:
 
         This method continuously processes different types of commands:
         - ABORT: Interrupt specific requests on instances
-        - SYNC: Interrupt instance, pull new model weights, and resume generation
+        - SLEEP: Release instance GPU memory
+        - WAKE_UP: Reacquire instance GPU memory
 
         The loop runs until stop_command_handler is set to True.
         """
@@ -96,58 +97,6 @@ class CommandHandlerMixin:
                     # Post process the command result
                     self._complete_command(command_id, result)
 
-                elif command_type == CommandType.SYNC:
-                    # Interrupt the instance, pull the model weights from PS and resume generation.
-                    instance_ids = command_args.get("instance_ids", None)
-                    curr_ps_model_version = command_args.get("curr_ps_model_version", None)
-                    wait_model_sync = command_args.get("wait_model_sync", False)
-                    if not isinstance(instance_ids, list):
-                        instance_ids = [instance_ids]
-                    if instance_ids is None or curr_ps_model_version is None:
-                        raise ValueError(
-                            "SYNC command must contain 'instance_ids' and 'curr_ps_model_version' in args."
-                        )
-                    psrl_logger.info(
-                        f"Received SYNC command: instance_ids={instance_ids!r}, "
-                        f"ps_model_version={curr_ps_model_version}."
-                    )
-
-                    # Skip instances that are sleeping
-                    is_sleeping = await asyncio.gather(
-                        *[self.server_handles[instance_id[0]].is_sleeping.remote() for instance_id in instance_ids]
-                    )
-                    sync_instance_ids = [
-                        instance_id for instance_id, sleeping in zip(instance_ids, is_sleeping) if not sleeping
-                    ]
-                    sleeping_instance_ids = [
-                        instance_id for instance_id, sleeping in zip(instance_ids, is_sleeping) if sleeping
-                    ]
-                    if sleeping_instance_ids:
-                        psrl_logger.info(f"Skipping SYNC for sleeping instances: {sleeping_instance_ids}")
-
-                    if not sync_instance_ids:
-                        self._complete_command(command_id, None)
-                    else:
-                        # Sync with PS (interrupt, pull model, and resume generation)
-                        sync_futures = []
-
-                        for instance_id in instance_ids:
-                            # NOTE(linsh): Ignore DP rank for now.
-                            replica_id, _ = instance_id
-                            sync_future = self.server_handles[replica_id].sync_with_ps.remote(
-                                curr_ps_model_version,
-                                pause_generation=True,
-                            )
-                            sync_futures.append(sync_future)
-
-                        # Post process the command result
-                        if wait_model_sync:
-                            await asyncio.gather(*sync_futures)
-                            self._complete_command(command_id, None)
-                        else:
-                            # NOTE(linsh): Callers need not always wait for the parameter server pull.
-                            self._complete_command(command_id, None)
-                            await asyncio.gather(*sync_futures)  # Wait for the sync to complete
                 elif command_type == CommandType.SLEEP:
                     instance_ids = command_args.get("instance_ids", None)
                     if not isinstance(instance_ids, list):
