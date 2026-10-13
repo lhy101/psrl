@@ -1,3 +1,18 @@
+# Reference run for aligning DryRun-RL's simulator against the real stack.
+#
+# This is the run DryRun-RL's `examples/simulate/psrl_aligned.sh` is matched
+# against, so the two must describe the same system: whenever a knob here moves,
+# the matching export over there has to move with it.
+#
+# `train_batch_size=32` rather than 8 is the point of this configuration. At 8
+# the KV cache never fills, so preemption, eviction and re-prefill are never
+# exercised and a simulator could get them all wrong while still matching. At 32
+# the cache saturates: peak KV utilisation reaches 1.0 and requests are aborted
+# and resumed.
+#
+# Its logs land in `megatron_psrl_log/qwen3_8b_megatron_simulate/`, which
+# DryRun-RL reads directly to extract the workload trace and to plot the real
+# instance-load figure beside the simulated one.
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
@@ -12,7 +27,7 @@ test_files=/jizhicfs/lhy/data/dapo/aime-2024.parquet
 OUTPUT_DIR=${PSRL_PATH}/examples/dapo_trainer/output
 mkdir -p "$OUTPUT_DIR"
 project_name=simulate
-experiment_name=qwen3_8b_megatron_baseline
+experiment_name=qwen3_8b_megatron_simulate
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/"${project_name}"/"${experiment_name}"
 LOG_DIR=${OUTPUT_DIR}/logs/$(date +%Y%m%d_%H%M%S)
 
@@ -21,8 +36,10 @@ mkdir -p "$LOG_DIR"
 mkdir -p "$CKPTS_DIR"
 
 
-train_batch_size=8
+train_batch_size=32
 # train_batch_size=60
+max_prompt_length=1024
+max_response_length=10240
 tensor_model_parallel_size=2
 pipeline_model_parallel_size=3
 rollout_tensor_model_parallel_size=1
@@ -76,8 +93,8 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=$train_batch_size \
-    data.max_prompt_length=1024 \
-    data.max_response_length=10240 \
+    data.max_prompt_length=${max_prompt_length} \
+    data.max_response_length=${max_response_length} \
     data.filter_overlong_prompts=False \
     data.truncation='left' \
     \
@@ -146,6 +163,6 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     trainer.val_before_train=False \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.total_training_steps=10 \
+    trainer.total_training_steps=5 \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.total_epochs=15 $@ 2>&1 | tee "train.log"
+    trainer.total_epochs=15 $@ 2>&1 | tee "train_loopback_fix.log"

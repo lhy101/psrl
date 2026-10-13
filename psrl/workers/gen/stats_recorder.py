@@ -33,18 +33,59 @@ class StatsRecorder:
         self._file_handles: dict[str, IO[str]] = {}  # filename -> open file handle
         os.makedirs(logging_path, exist_ok=True)
 
-    def write_config(self, routing_strategy: str, partial_rollout: bool) -> None:
-        """Write stats_config.json once at coordinator startup."""
+    def write_config(
+        self,
+        routing_strategy: str,
+        partial_rollout: bool,
+        instances: "list[dict] | None" = None,
+    ) -> None:
+        """Write stats_config.json once at coordinator startup.
+
+        Args:
+            routing_strategy: Name of the configured routing strategy.
+            partial_rollout: Whether partial rollout is enabled.
+            instances: One entry per stats file describing what that file holds,
+                keyed by `stats_file`. Analysis tools read this instead of parsing
+                the filename, which cannot say whether `r3` is a rollout or a
+                validate replica nor what TP degree it runs.
+        """
         config_path = os.path.join(self._logging_path, "stats_config.json")
         payload = {
             "routing_strategy": routing_strategy,
             "partial_rollout": partial_rollout,
             "interval_in_s": self._config.status_collection.stats_recorder.interval_in_s,
             "started_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "instances": instances or [],
         }
         with open(config_path, "w") as f:
             json.dump(payload, f, indent=2)
         logger.info(f"StatsRecorder: wrote config to {config_path}")
+
+    def write_instance_registry(self, instances: "list[dict]") -> None:
+        """Rewrite stats_config.json with the instance registry.
+
+        Replicas register after the coordinator starts, so the registry is only
+        complete once bootstrap finishes. This merges it into the existing file
+        rather than writing a second one, keeping one metadata file per run.
+
+        Args:
+            instances: One entry per stats file, as described in `write_config`.
+        """
+        config_path = os.path.join(self._logging_path, "stats_config.json")
+        payload = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path) as f:
+                    payload = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning(f"StatsRecorder: could not read {config_path} to merge the registry: {e}")
+        payload["instances"] = instances
+        try:
+            with open(config_path, "w") as f:
+                json.dump(payload, f, indent=2)
+            logger.info(f"StatsRecorder: wrote instance registry with {len(instances)} entries to {config_path}")
+        except OSError as e:
+            logger.warning(f"StatsRecorder: failed to write {config_path}: {e}")
 
     def record(self, instance_to_engine_status: "dict[RolloutInstanceId, EngineStats]") -> None:
         """

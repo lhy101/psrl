@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -81,8 +82,8 @@ from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.serialization import json_encode_default
 from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
 from psrl.utils.dataset import DataProcessor
-from psrl.utils.elastic_rm.cluster_topology import ClusterTopology
 from psrl.utils.elastic_rm.elastic_executor import ElasticExecutor
+from psrl.utils.gpu_topology import ClusterTopology
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -379,6 +380,34 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.n_validate_instances = (
             self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
         )
+
+        # Dynamic parallelism. `n_rollout_instances` was already set to the slot count by
+        # `init_resource_pool_mgr`, so one `rollout_{i}` worker group exists per slot.
+        dynamic_parallel_config = self.config.psrl.get("dynamic_parallel", None)
+        self.dynamic_parallel_mode = dynamic_parallel_config is not None and dynamic_parallel_config.enable
+        self.replica_slot_table = None
+        self.cohort_planner = None
+        self._slot_id_to_replica: dict[int, PSRL_vLLMReplica] = {}
+        self._initial_awake_slot_ids: list[int] = []
+        if self.dynamic_parallel_mode:
+            from psrl.utils.gpu_topology import GPUSlot
+            from psrl.workers.gen.dynamic_parallel import build_cohort_planner, build_slot_table
+
+            deployment = self.config.psrl.deployment
+            gpus_per_node = deployment.rollout_ngpus_per_node_per_instance
+            node_layout = {
+                f"node{node_idx}": [GPUSlot(node_id=f"node{node_idx}", gpu_id=g) for g in range(gpus_per_node)]
+                for node_idx in range(deployment.rollout_nnodes_per_instance)
+            }
+            self.replica_slot_table = build_slot_table(
+                node_layout, [int(tp) for tp in dynamic_parallel_config.tp_degrees]
+            )
+            self.cohort_planner = build_cohort_planner(dynamic_parallel_config)
+            assert len(self.replica_slot_table) == self.n_rollout_instances, (
+                f"Replica slot table has {len(self.replica_slot_table)} slots but n_rollout_instances is "
+                f"{self.n_rollout_instances}. They are set from the same table and must agree."
+            )
+            psrl_logger.info(f"[dynamic_parallel] {self.replica_slot_table!r} with planner {self.cohort_planner!r}.")
 
         self._initialize_queue_buffers()
         if self.config.psrl.rollout_coordination.redundant_rollout.enable:
@@ -1353,6 +1382,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     replica.data_parallel_size,
                     is_validate=False if replica.tag == "rollout" else True,
                     model_version=0,
+                    slot_id=getattr(replica, "slot_id", None),
                 )
             )
             if self.tag_to_base_worker_ids.get(replica.tag) is None:
@@ -1360,33 +1390,184 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tag_to_base_worker_ids[replica.tag].append(replica_id)
         ray.get(futures)
 
+    def _resolve_rollout_parallel_config(self, base_config, tag: str, instance_idx: int):
+        """Return the rollout config for one instance, with its own parallelism.
+
+        Under `heterogeneous_rollout` or `dynamic_parallel` each instance gets its own
+        TP degree, so every instance needs a distinct config object. Mutating the
+        shared one would leave each instance seeing whichever degree was written last.
+
+        Args:
+            base_config: The rollout config group for this tag.
+            tag: Either rollout or validate. Only rollout is heterogeneous.
+            instance_idx: Index into the per-instance parallelism lists, or into the
+                replica slot table under dynamic parallelism.
+
+        Returns:
+            The base config when homogeneous, otherwise a copy carrying this
+            instance's degrees.
+        """
+        if tag != "rollout":
+            return base_config
+
+        if self.dynamic_parallel_mode:
+            slot = self.replica_slot_table.slots[instance_idx]
+            instance_config = copy.deepcopy(base_config)
+            instance_config.tensor_model_parallel_size = slot.tp
+            instance_config.pipeline_model_parallel_size = 1
+            return instance_config
+
+        heterogeneous = self.config.psrl.deployment.heterogeneous_rollout
+        if not heterogeneous.enable:
+            return base_config
+
+        instance_config = copy.deepcopy(base_config)
+        instance_config.tensor_model_parallel_size = heterogeneous.tensor_model_parallel_size_per_instance[
+            instance_idx
+        ]
+        instance_config.pipeline_model_parallel_size = heterogeneous.pipeline_model_parallel_size_per_instance[
+            instance_idx
+        ]
+        return instance_config
+
     def init_rollout_servers(
         self,
         worker_group_list: list[RayWorkerGroup],
         tag: str = "rollout",
     ):
+        if self.dynamic_parallel_mode and tag == "rollout":
+            self._init_rollout_servers_staged(worker_group_list)
+            return
+        self._init_rollout_servers_group(worker_group_list, tag, group_offset=0)
+
+    def _init_rollout_servers_staged(self, worker_group_list: list[RayWorkerGroup]):
+        """Build replica slots one TP degree at a time, sleeping each stage before the next.
+
+        vLLM freezes `num_gpu_blocks` during init and never re-profiles on wake, so a
+        slot must profile against a GPU whose other slots are already asleep. Descending
+        TP order is the worst case, since the widest engine profiles first and the
+        narrowest profiles against whatever the others left behind.
+
+        Every slot must also register with SMG and the PS before the NIXL shard-grid
+        barrier, because that barrier is one-shot and a TP degree absent from it can
+        never be admitted later.
+        """
+        table = self.replica_slot_table
+        for tp in sorted(table.tp_degrees, reverse=True):
+            stage_slots = table.by_tp[tp]
+            stage_indices = [table.slots.index(slot) for slot in stage_slots]
+            psrl_logger.info(f"[dynamic_parallel] Staging TP-{tp}: {len(stage_slots)} slots.")
+            stage_replicas = self._init_rollout_servers_group(
+                [worker_group_list[i] for i in stage_indices],
+                "rollout",
+                group_offset=0,
+                slot_indices=stage_indices,
+            )
+            # Free this stage's pages so the next degree profiles against a clear GPU.
+            # Plain `sleep` rather than `nixl_sleep`: the NIXL client is only initialized
+            # by the protocol that runs after all worker init, so `nixl_sleep` would block
+            # on `_is_init_nixl_client` forever. There is nothing registered to
+            # deregister yet either.
+            ray.get([replica.servers[0].sleep.remote(level=2) for replica in stage_replicas])
+            psrl_logger.info(f"[dynamic_parallel] TP-{tp} slots built and asleep.")
+
+        # Record which slots the planner wants awake for version 0. All slots are woken
+        # below for the NIXL barrier, and `sleep_unselected_parallelism_slots` puts the
+        # rest back to sleep once registration is done.
+        from psrl.workers.gen.dynamic_parallel import BoundaryState
+
+        plan = self.cohort_planner.plan(
+            table,
+            BoundaryState(model_version=0, staleness_budget=self.config.psrl.staleness),
+        )
+        self._initial_awake_slot_ids = sorted(slot.slot_id for slot in plan.awake)
+        psrl_logger.info(
+            f"[dynamic_parallel] All {len(table)} slots built and asleep. "
+            f"Version 0 will wake {self._initial_awake_slot_ids}."
+        )
+
+        # Every slot must be awake for the NIXL barrier. Registration pins the live
+        # weight pages, and a sleeping engine has none, so `registerMem` fails with
+        # NIXL_ERR_BACKEND. Waking here is safe because staged profiling is already
+        # done and `num_gpu_blocks` is frozen, so nothing re-profiles.
+        all_replicas = [self._slot_id_to_replica[slot.slot_id] for slot in table.slots]
+        ray.get([replica.servers[0].wake_up.remote() for replica in all_replicas])
+        psrl_logger.info(f"[dynamic_parallel] Woke all {len(all_replicas)} slots for the NIXL barrier.")
+
+    def sleep_unselected_parallelism_slots(self):
+        """Sleep every slot the version-0 plan did not pick, after NIXL registration.
+
+        All slots are awake for the barrier, which leaves the pool oversubscribed. This
+        returns it to one awake slot set. Runs before the initial weight pull so that
+        pull only touches slots that will actually serve.
+        """
+        if not self.dynamic_parallel_mode:
+            return
+        table = self.replica_slot_table
+        keep = set(self._initial_awake_slot_ids)
+        to_sleep = [self._slot_id_to_replica[slot.slot_id] for slot in table.slots if slot.slot_id not in keep]
+        if to_sleep:
+            # Pause at the gateway before sleeping, mirroring the validate path, so SMG
+            # never selects a worker whose weights are about to be unmapped.
+            paused_ids = [str(replica.replica_rank) for replica in to_sleep]
+            self._post_gateway_worker_routing_control("pause", paused_ids)
+            ray.get([replica.servers[0].nixl_sleep.remote(level=2) for replica in to_sleep])
+        ray.get(self.rollout_coordinator.set_replica_slot_table.remote(table, self._initial_awake_slot_ids))
+        psrl_logger.info(
+            f"[dynamic_parallel] Slept {len(to_sleep)} unselected slots. "
+            f"Awake: {self._initial_awake_slot_ids}."
+        )
+
+    def _init_rollout_servers_group(
+        self,
+        worker_group_list: list[RayWorkerGroup],
+        tag: str = "rollout",
+        group_offset: int = 0,
+        slot_indices: list[int] | None = None,
+    ) -> list[PSRL_vLLMReplica]:
         status_sink_endpoint = ray.get(self.rollout_coordinator.get_status_sink_endpoint.remote())
         if tag == "validate":
-            rollout_world_size = (
-                self.config.train_actor_rollout_ref.rollout.tensor_model_parallel_size
-                * self.config.train_actor_rollout_ref.rollout.data_parallel_size
-                * self.config.train_actor_rollout_ref.rollout.pipeline_model_parallel_size
-            )
-            rollout_config = self.config.train_actor_rollout_ref.rollout
+            base_rollout_config = self.config.train_actor_rollout_ref.rollout
         else:
-            rollout_world_size = (
-                self.config.gen_actor_rollout_ref.rollout.tensor_model_parallel_size
-                * self.config.gen_actor_rollout_ref.rollout.data_parallel_size
-                * self.config.gen_actor_rollout_ref.rollout.pipeline_model_parallel_size
-            )
-            rollout_config = self.config.gen_actor_rollout_ref.rollout
+            base_rollout_config = self.config.gen_actor_rollout_ref.rollout
         model_config = self.config.train_actor_rollout_ref.model
         rollout_replicas = []
         init_tasks = []
-        for worker_group in worker_group_list:
+        for local_idx, worker_group in enumerate(worker_group_list):
+            # One worker group per instance, so its index selects the parallelism. Under
+            # staged bootstrap only a subset is passed, so the slot index is explicit.
+            worker_group_idx = slot_indices[local_idx] if slot_indices is not None else local_idx + group_offset
+            rollout_config = self._resolve_rollout_parallel_config(base_rollout_config, tag, worker_group_idx)
+            rollout_world_size = (
+                rollout_config.tensor_model_parallel_size
+                * rollout_config.data_parallel_size
+                * rollout_config.pipeline_model_parallel_size
+            )
             world_size = worker_group.world_size
+            if world_size % rollout_world_size != 0:
+                raise ValueError(
+                    f"Rollout instance {worker_group_idx} has {world_size} GPUs, which is not divisible by its "
+                    f"parallelism product {rollout_world_size} (tp="
+                    f"{rollout_config.tensor_model_parallel_size}, dp={rollout_config.data_parallel_size}, "
+                    f"pp={rollout_config.pipeline_model_parallel_size})."
+                )
             num_replicas = world_size // rollout_world_size
-            psrl_logger.info(f"[{tag}]: {world_size=}, {rollout_world_size=}, {num_replicas=}")
+            gpus_per_node = (
+                self.config.psrl.deployment.rollout_ngpus_per_node_per_instance
+                if tag == "rollout"
+                else self.config.psrl.deployment.validate_ngpus_per_node_per_instance
+            )
+            if self.config.psrl.deployment.heterogeneous_rollout.enable and tag == "rollout":
+                gpus_per_node = self.config.psrl.deployment.heterogeneous_rollout.rollout_ngpus_per_node_per_instance[
+                    worker_group_idx
+                ]
+            if self.dynamic_parallel_mode and tag == "rollout":
+                # A slot never spans nodes, so its engine sees exactly its own GPUs.
+                gpus_per_node = rollout_config.tensor_model_parallel_size
+            psrl_logger.info(
+                f"[{tag}]: instance={worker_group_idx}, {world_size=}, {rollout_world_size=}, {num_replicas=}, "
+                f"tp={rollout_config.tensor_model_parallel_size}, {gpus_per_node=}"
+            )
             # Allocate replica indices atomically across rollout and validation initialization.
             with self._rollout_replica_alloc_lock:
                 curr_replica_num = len(self.rollout_replicas)
@@ -1406,15 +1587,20 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             config=rollout_config,
                             model_config=model_config,
                             gen_interface=gen_interface,
-                            gpus_per_node=(
-                                self.config.psrl.deployment.rollout_ngpus_per_node_per_instance
-                                if tag == "rollout"
-                                else self.config.psrl.deployment.validate_ngpus_per_node_per_instance
-                            ),
+                            gpus_per_node=gpus_per_node,
                             tag=tag,
                         )
                     )
                 self.rollout_replicas.extend(new_rollout_replicas)
+            if self.dynamic_parallel_mode and tag == "rollout":
+                # One replica per slot, since a slot's world size is exactly its TP degree.
+                assert len(new_rollout_replicas) == 1, (
+                    f"Slot {worker_group_idx} produced {len(new_rollout_replicas)} replicas. A replica slot "
+                    "must map to exactly one replica."
+                )
+                slot_id = self.replica_slot_table.slots[worker_group_idx].slot_id
+                new_rollout_replicas[0].slot_id = slot_id
+                self._slot_id_to_replica[slot_id] = new_rollout_replicas[0]
             rollout_replicas.extend(new_rollout_replicas)
             init_tasks.extend([replica.init_model(worker_group) for replica in new_rollout_replicas])
         self._run_all(init_tasks)
@@ -1425,12 +1611,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.server_addresses.extend([replica._server_address for replica in rollout_replicas])
 
         # Update Prometheus configuration with server addresses
-        if rollout_config.prometheus.enable:
-            if rollout_config.disable_log_stats:
+        if base_rollout_config.prometheus.enable:
+            if base_rollout_config.disable_log_stats:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
-            update_prometheus_config(rollout_config.prometheus, self.server_addresses, rollout_config.name)
+            update_prometheus_config(base_rollout_config.prometheus, self.server_addresses, base_rollout_config.name)
 
         self.register_rollout_servers(rollout_replicas)
+        return rollout_replicas
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1518,6 +1705,39 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             )
             return sub_rp
 
+        dynamic_slot_pool = None
+        if self.dynamic_parallel_mode:
+            dynamic_slot_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout)
+            # Materialize the placement groups once so every slot carves from the same bundles.
+            dynamic_slot_pool.get_placement_groups(strategy="STRICT_PACK", device_name=self.device_name)
+            psrl_logger.info(
+                f"[dynamic_parallel] Slot pool: name_prefix={dynamic_slot_pool.name_prefix} "
+                f"world_size={dynamic_slot_pool.world_size} store={list(dynamic_slot_pool.store)}."
+            )
+
+        def _build_slot_resource_pool(slot) -> SubRayResourcePool:
+            """Carve one replica slot's GPU range out of the shared slot pool.
+
+            Unlike the elastic path this start index is the slot's real GPU offset,
+            not a rotation, because slots of different TP degrees are meant to
+            overlap and take turns being awake.
+            """
+            node_offset = self.replica_slot_table.node_order.index(slot.node_id)
+            gpus_per_node = dynamic_slot_pool.store[node_offset]
+            start_bundle_index = node_offset * gpus_per_node + slot.start_offset
+            return SubRayResourcePool(
+                process_on_nodes=dynamic_slot_pool.store,
+                use_gpu=dynamic_slot_pool.use_gpu,
+                name_prefix=f"{dynamic_slot_pool.name_prefix}_slot{slot.slot_id}",
+                max_colocate_count=dynamic_slot_pool.max_colocate_count,
+                detached=dynamic_slot_pool.detached,
+                accelerator_type=dynamic_slot_pool.accelerator_type,
+                resource_num_per_bundle=dynamic_slot_pool.resource_num_per_bundle,
+                placement_groups=dynamic_slot_pool.pgs,
+                start_bundle_index=start_bundle_index,
+                subgroup_world_size=slot.tp,
+            )
+
         # create rollout
         for i in range(self.n_rollout_instances):
             if self.elastic_rm_mode:
@@ -1530,16 +1750,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     subgroup_world_size=rollout_world_size,
                     tag=f"rollout_{i}",
                 )
+            elif self.dynamic_parallel_mode:
+                rollout_resource_pool = _build_slot_resource_pool(self.replica_slot_table.slots[i])
             else:
                 rollout_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, i)
-            rollout_config = self.config.gen_actor_rollout_ref.rollout
-            if self.config.psrl.deployment.heterogeneous_rollout.enable:
-                rollout_config.rollout.tensor_model_parallel_size = (
-                    self.config.psrl.deployment.heterogeneous_rollout.tensor_model_parallel_size_per_instance[i]
-                )
-                rollout_config.rollout.pipeline_model_parallel_size = (
-                    self.config.psrl.deployment.heterogeneous_rollout.pipeline_model_parallel_size_per_instance[i]
-                )
+            rollout_config = self._resolve_rollout_parallel_config(
+                self.config.gen_actor_rollout_ref.rollout, "rollout", i
+            )
 
             rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[PSRL_Role.Rollout],
@@ -2126,6 +2343,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             else:
                 # Push resumed actor weights before the initial pull so all workers receive them first.
                 self._resume_load_and_push_to_ps()
+
+            # All slots were awake for the NIXL barrier. Return the pool to one awake
+            # set before the initial pull, so the pull only touches serving slots.
+            self.sleep_unselected_parallelism_slots()
 
             # Pull initial PS weights now. A sleeping colocated actor pulls later in `switch_to_trainer_mode`.
             initial_pull_tag = "all" if self.is_rollout_mode_in_actor else "rollout"

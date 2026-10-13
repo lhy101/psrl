@@ -92,13 +92,18 @@ def compute_response_mask(data: DataProto):
 
 
 class PSRL_Role(Enum):
+    """Worker roles a resource pool can be assigned to.
+
+    PSRL disaggregates generation from training, so there is no fused
+    actor-rollout role. Each member must be reachable from
+    `ResourcePoolManager.mapping`.
+    """
+
     Actor = enum.auto()
     Rollout = enum.auto()
-    ActorRollout = enum.auto()
     Critic = enum.auto()
     RefPolicy = enum.auto()
     RewardModel = enum.auto()
-    ActorRolloutRef = enum.auto()
     Validate = enum.auto()
     TeacherModel = enum.auto()
     DummyPolicy = enum.auto()
@@ -113,6 +118,7 @@ class ResourcePoolManager:
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[PSRL_Role, list[str]]
     resource_num_per_bundle: dict[str, int] = field(default_factory=dict)
+    max_colocate_per_pool: dict[str, int] = field(default_factory=dict)
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
@@ -128,7 +134,7 @@ class ResourcePoolManager:
             resource_pool = RayResourcePool(
                 process_on_nodes=process_on_nodes,
                 use_gpu=True,
-                max_colocate_count=1,
+                max_colocate_count=self.max_colocate_per_pool.get(resource_pool_name, 1),
                 name_prefix=resource_pool_name,
                 resource_num_per_bundle=self.resource_num_per_bundle.get(resource_pool_name, 1),
             )

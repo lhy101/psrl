@@ -1,0 +1,50 @@
+# Dynamic heterogeneous rollout parallelism.
+# Every TP degree below gets its replica slots built at startup, and each weight
+# update switches which GPU-disjoint subset is awake. Slots cannot be added later
+# because the NIXL shard-grid negotiation is a one-shot barrier.
+#
+# Run slots WITH CUDA graphs, via psrl.tms.range=gen and
+# psrl.tms.enable_cuda_graph=true. TMS pauses and resumes the graph region, so
+# graphs survive a sleep and wake cycle and the wake is about 10x faster. Without
+# TMS, vLLM destroys the graphs on sleep and fails to recapture them on wake.
+# Use `gen` rather than `all`: `all` also wraps the train worker, whose optimizer
+# offload copies out of a TMS region and fails with CUDA invalid argument.
+# Measured on 8xH20 with Qwen3-8B, see FINDINGS.md.
+
+# Whether to materialize every TP degree and switch between them.
+# When False, the rollout pool behaves exactly as it does without this feature.
+# Requires rollout.enable_sleep_mode, plus either TMS graph mode (preferred) or
+# rollout.enforce_eager.
+#
+# When True, psrl.deployment.rollout_ngpus_per_node_per_instance and
+# rollout_nnodes_per_instance describe the WHOLE rollout pool rather than one
+# instance, because the slot table derives the instance count from them.
+# psrl.deployment.n_rollout_instances is overwritten with that count and any value
+# set for it is ignored.
+enable: False
+
+# TP degrees to materialize. Each must divide the per-node rollout GPU count,
+# and the largest must fit inside one node. Every degree costs one more resident
+# vLLM engine per GPU. Measured on 8xH20 with Qwen3-8B: a sleeping engine holds
+# under 1 GiB and the awake engine keeps its full KV budget, so the binding cost
+# is startup. Bootstrap builds slots one at a time, and the full {1,2,4,8} set
+# took 37 minutes against roughly 25 for {1,2}. See FINDINGS.md.
+tp_degrees: [1, 2]
+
+# Registered cohort planner deciding the awake set at each boundary.
+planner: static
+
+# slot_schedule: used by planner='scripted'. A list of slot-id lists, cycling by
+# model version. Each entry can mix TP degrees, so [[0,4,5],[2,3,4,5]] alternates
+# between "one TP-2 + two TP-1" and "four TP-1". Must be GPU-disjoint per entry.
+slot_schedule: null
+
+# `static` planner: TP degrees to cycle through, indexed by model version.
+# A single entry never switches and is the baseline. Several entries exercise the
+# switch path without a solver. Null uses the first entry of tp_degrees.
+tp_schedule: null
+
+# Whether to re-plan the awake set at each weight-update boundary.
+# When False the initial plan holds for the whole job, which isolates the cost of
+# oversubscription from the cost of switching.
+switch_on_boundary: True

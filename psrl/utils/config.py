@@ -324,7 +324,28 @@ def validate_config(
 
     # Check TMS configuration
     if config.psrl.tms.enable_cuda_graph:
-        assert config.psrl.tms.range == "all", "TMS CUDA graph can only be enabled when TMS range is 'all'"
+        assert config.psrl.tms.range in ["gen", "all"], (
+            f"TMS CUDA graph is installed on the rollout worker, so TMS range must be 'gen' or 'all', "
+            f"got {config.psrl.tms.range!r}."
+        )
+    # Megatron and FSDP2 offload optimizer state with a plain device-to-host copy, which
+    # fails with cudaErrorInvalidValue on a TMS-managed region. Reject the pair rather
+    # than letting the train worker die during init_model.
+    if config.psrl.tms.range == "all":
+        megatron_offloads = (
+            config.train_actor_rollout_ref.actor.strategy == "megatron"
+            and config.train_actor_rollout_ref.actor.megatron.optimizer_offload
+        )
+        fsdp_offloads = (
+            config.train_actor_rollout_ref.actor.strategy == "fsdp2"
+            and config.train_actor_rollout_ref.actor.fsdp_config.optimizer_offload
+        )
+        assert not (megatron_offloads or fsdp_offloads), (
+            "psrl.tms.range='all' enables TMS on the train worker, whose optimizer offload "
+            "copies out of a TMS-managed region and fails with CUDA error: invalid argument. "
+            "Use psrl.tms.range='gen' to keep TMS on rollout workers only, or turn optimizer "
+            "offload off."
+        )
     if config.psrl.tms.range not in ["train", "all"]:
         assert (
             config.train_actor_rollout_ref.actor.strategy == "megatron"
@@ -487,9 +508,121 @@ def validate_config(
                 f"got {env_worker_config.cpu_slots_per_worker!r}."
             )
 
+    _validate_dynamic_parallel(config)
     _resolve_rollout_max_model_len(config)
 
     print("[validate_config] All configuration checks passed successfully!")
+
+
+def _validate_dynamic_parallel(config: DictConfig) -> None:
+    """Check that the configured TP degrees can tile the rollout pool.
+
+    Every degree's replica slots are built at startup, so a degree that cannot
+    tile a node must fail here rather than mid-bootstrap.
+
+    Raises:
+        ValueError: If the degree set does not fit the pool, if sleep mode is off,
+            or if elastic_rm is also enabled.
+    """
+    dyn_config = config.psrl.get("dynamic_parallel", None)
+    if dyn_config is None or not dyn_config.enable:
+        return
+
+    deployment_config = config.psrl.deployment
+    gpus_per_node = int(deployment_config.rollout_ngpus_per_node_per_instance)
+    tp_degrees = [int(tp) for tp in dyn_config.tp_degrees]
+
+    if not tp_degrees:
+        raise ValueError("psrl.dynamic_parallel.tp_degrees must name at least one TP degree.")
+    for tp in tp_degrees:
+        if tp < 1:
+            raise ValueError(f"psrl.dynamic_parallel.tp_degrees must be positive, got {tp!r}.")
+        if tp > gpus_per_node:
+            raise ValueError(
+                f"psrl.dynamic_parallel.tp_degrees holds {tp}, which exceeds the {gpus_per_node} GPUs per node "
+                "in psrl.deployment.rollout_ngpus_per_node_per_instance. A TP group must fit inside one node."
+            )
+        if gpus_per_node % tp != 0:
+            raise ValueError(
+                f"psrl.dynamic_parallel.tp_degrees holds {tp}, which does not evenly tile the {gpus_per_node} "
+                "GPUs per node in psrl.deployment.rollout_ngpus_per_node_per_instance."
+            )
+
+    schedule = dyn_config.get("tp_schedule", None)
+    if schedule:
+        unknown = sorted({int(tp) for tp in schedule} - set(tp_degrees))
+        if unknown:
+            raise ValueError(
+                f"psrl.dynamic_parallel.tp_schedule names degrees {unknown} that are absent from tp_degrees "
+                f"{sorted(tp_degrees)}. A degree not built at startup can never be woken."
+            )
+
+    # Every slot must be awake simultaneously for the NIXL shard-grid barrier, because
+    # registration pins live weight pages and a sleeping engine has none. So the sum of
+    # per-GPU reservations has to fit the card even though only one slot serves at a time.
+    # Measured: exceeding this OOMs the vLLM worker during the barrier wake.
+    rollout_config = config.gen_actor_rollout_ref.rollout
+    engines_per_gpu = len(set(tp_degrees))
+    gpu_util = float(rollout_config.get("gpu_memory_utilization", 0.5))
+    if gpu_util * engines_per_gpu > 1.0:
+        raise ValueError(
+            f"psrl.dynamic_parallel.tp_degrees has {engines_per_gpu} distinct degrees, so every GPU hosts "
+            f"{engines_per_gpu} engines that must all be awake for the NIXL barrier. With "
+            f"gen_actor_rollout_ref.rollout.gpu_memory_utilization={gpu_util} that needs "
+            f"{gpu_util * engines_per_gpu:.2f} of each GPU and the barrier wake will run out of memory. "
+            f"Set gpu_memory_utilization to at most {1.0 / engines_per_gpu:.2f}, or narrow tp_degrees."
+        )
+
+    # A level-2 sleep is what frees a slot's GPU pages for the incoming slot. The key is
+    # absent from the composed YAML because it is a dataclass default of True, so read it
+    # with a default rather than by attribute.
+    if not rollout_config.get("enable_sleep_mode", True):
+        raise ValueError(
+            "psrl.dynamic_parallel.enable requires gen_actor_rollout_ref.rollout.enable_sleep_mode, "
+            "because switching slots relies on releasing GPU memory at sleep level 2."
+        )
+
+    # Waking an engine whose CUDA graphs were destroyed on sleep fails in vLLM's
+    # graph recapture. TMS avoids that path by pausing and resuming the graph
+    # region instead, so graphs stay usable. Eager also works but is slower and
+    # inverts the high-TP latency advantage below batch 32. See FINDINGS.md.
+    tms_config = config.psrl.get("tms", None)
+    tms_graph_ready = (
+        tms_config is not None and tms_config.range in ["gen", "all"] and bool(tms_config.enable_cuda_graph)
+    )
+    if not tms_graph_ready and not rollout_config.get("enforce_eager", False):
+        raise ValueError(
+            "psrl.dynamic_parallel.enable needs CUDA graphs to survive a sleep and wake cycle. "
+            "Set psrl.tms.range=gen and psrl.tms.enable_cuda_graph=true, which pauses and resumes "
+            "the graph region. Otherwise vLLM destroys the graphs on sleep and fails to recapture "
+            "them on wake. Setting gen_actor_rollout_ref.rollout.enforce_eager=true also works, at "
+            "the cost of decode throughput."
+        )
+
+    if deployment_config.elastic_rm.enable:
+        raise ValueError(
+            "psrl.dynamic_parallel.enable and psrl.deployment.elastic_rm.enable are mutually exclusive. "
+            "Both decide which instances are awake, on different axes, so enabling both leaves the awake "
+            "set contested."
+        )
+
+    if deployment_config.heterogeneous_rollout.enable:
+        raise ValueError(
+            "psrl.dynamic_parallel.enable supersedes psrl.deployment.heterogeneous_rollout.enable, "
+            "which assigns one static TP degree per instance. Enable only one."
+        )
+
+    # Measured: with validate colocated on trainer GPUs at 0.9/0.1 fractions, adding the
+    # oversubscribed slot pool puts three fractional claimants on one GPU and the trainer
+    # dies in reduce_scatter_tensor_coalesced with an NCCL error. The same run completes
+    # cleanly with colocation off. See FINDINGS.md.
+    if config.psrl.colocate_validate_and_train:
+        raise ValueError(
+            "psrl.dynamic_parallel.enable and psrl.colocate_validate_and_train are incompatible. "
+            "Validate instances take fractional GPU bundles on the trainer's GPUs, and adding the "
+            "oversubscribed rollout slot pool on top makes the trainer's NCCL collectives fail. "
+            "Set psrl.colocate_validate_and_train=False, which gives validate its own GPUs."
+        )
 
 
 def _resolve_rollout_max_model_len(config: DictConfig) -> None:

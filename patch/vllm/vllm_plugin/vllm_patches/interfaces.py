@@ -40,4 +40,7 @@ def supports_weight_layout(
 
     model_type = model if isinstance(model, type) else type(model)
     register_weight_layouts_for_module(model_type.__module__)
-    return isinstance(model, SupportsWeightLayout)
+    # Check the type, not `model`, so a class argument is answered the same way
+    # as an instance of it. The protocol matches on a method, which lives on the
+    # class either way.
+    return issubclass(model_type, SupportsWeightLayout)

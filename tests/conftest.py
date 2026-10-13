@@ -1,6 +1,7 @@
 # tests/conftest.py
 import importlib.util
 import os
+import pathlib
 import sys
 import types
 from unittest.mock import MagicMock
@@ -34,6 +35,32 @@ def _fake_module(dotted_name: str, **attrs) -> object:
 
 _HERE = os.path.dirname(__file__)
 _PSRL = os.path.join(_HERE, "../psrl")
+
+# Anchor for tests that load a module by file path. Deriving this from __file__
+# keeps the suite runnable from any checkout, unlike a per-file literal path.
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def load_psrl_module(dotted_name: str, repo_relative_path: str) -> object:
+    """Load a psrl module by repo-relative path, bypassing its package __init__.
+
+    Several CPU tests need a single module whose package __init__ pulls in Ray or
+    Torch. Importing by path sidesteps that.
+
+    Args:
+        dotted_name (str): Name to register the module under in `sys.modules`.
+        repo_relative_path (str): Path to the .py file, relative to the repo root.
+
+    Returns:
+        object: The loaded module.
+    """
+    return _load_module_direct(dotted_name, str(REPO_ROOT / repo_relative_path))
+
+
+# NOTE(claude): Do not stub a package into `sys.modules` from a test module's top
+# level. A `MagicMock` has no `__path__`, so a later `from pkg.sub import X` fails
+# with "is not a package", and the entry leaks into every test that runs after it.
+# Import the real module instead, or stub inside a fixture that restores state.
 
 # Stub out psrl.utils.logger so staleness_controller can import it on CPU.
 if "psrl.utils.logger" not in sys.modules:

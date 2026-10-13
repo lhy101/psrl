@@ -1593,7 +1593,7 @@ class PSRL_vLLMReplica(vLLMReplica):
             tms_cfg = self.psrl_config.get("tms", None) if hasattr(self.psrl_config, "get") else None
             tms_range = (tms_cfg.get("range", None) if tms_cfg is not None else None) or None
             tms_enable_nixl = bool(tms_cfg.get("enable_nixl", False)) if tms_cfg is not None else False
-            if tms_range == "all" or tms_enable_nixl:
+            if tms_range in ["gen", "all"] or tms_enable_nixl:
                 # add tms config to rollout workers
                 import torch_memory_saver  # noqa: F401
 
@@ -1606,7 +1606,7 @@ class PSRL_vLLMReplica(vLLMReplica):
                 vllm_patch_env = ""
                 if bool(tms_cfg.get("enable_cuda_graph", False)):
                     vllm_patch_env = "TMS:GRAPH"
-                elif tms_range == "all":
+                elif tms_range in ["gen", "all"]:
                     vllm_patch_env = "TMS"
 
                 env_vars.update(

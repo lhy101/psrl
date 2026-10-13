@@ -6,6 +6,7 @@ defaults:
   - rollout_coordination/proactive_filter_strategy@rollout_coordination.proactive_filter_strategy
   - rollout_coordination/session_strategy@rollout_coordination.session_strategy
   - deployment@deployment
+  - dynamic_parallel@dynamic_parallel
   - fine_grain_overlap@fine_grain_overlap
   - agentic_rl@agentic_rl
   - server_rollout@server_rollout

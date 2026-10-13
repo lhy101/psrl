@@ -171,6 +171,30 @@ def find_matching_jsonl_files(directory: str, substring: str, extensions: list[s
     return sorted(matching, key=lambda f: natural_sort_key(os.path.basename(f)))
 
 
+def load_instance_registry(directory: str) -> dict[str, dict]:
+    """Map each stats filename to its instance metadata, if the run recorded it.
+
+    `stats_config.json` carries the role and TP degree of every stats file,
+    which the filename alone cannot express. Returns an empty mapping for runs
+    predating the registry, so callers fall back to the bare filename.
+
+    Args:
+        directory: Directory holding the stats files and `stats_config.json`.
+
+    Returns:
+        dict[str, dict]: Keyed by `stats_file`, each value the registry entry.
+    """
+    config_path = os.path.join(directory, "stats_config.json")
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        with open(config_path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {entry["stats_file"]: entry for entry in payload.get("instances", []) if "stats_file" in entry}
+
+
 def collect_multiple_files(
     directory: str,
     substring: str,
@@ -219,6 +243,8 @@ def collect_multiple_files(
     all_series: dict[str, list[tuple[Any, float]]] = {}
     separate_series_list: list[dict[str, list[tuple[Any, float]]]] = []
 
+    registry = load_instance_registry(directory)
+
     for i, filepath in enumerate(files):
         # Use custom label if available, otherwise use basename without extension
         if custom_labels:
@@ -226,9 +252,16 @@ def collect_multiple_files(
             # Use custom label as complete label (not prefix)
             use_filename_as_label = False
         else:
-            file_label = os.path.splitext(os.path.basename(filepath))[0]
-            # Prefix original labels with filename
-            use_filename_as_label = True
+            entry = registry.get(os.path.basename(filepath))
+            if entry and entry.get("label"):
+                # The registry says which role and TP degree this file holds, which
+                # the filename cannot. Replace the label rather than prefixing it.
+                file_label = entry["label"]
+                use_filename_as_label = False
+            else:
+                file_label = os.path.splitext(os.path.basename(filepath))[0]
+                # Prefix original labels with filename
+                use_filename_as_label = True
 
         print(f"Processing {filepath}...")
         series = collect_by_processor(filepath, processor_name, file_label, use_filename_as_label)

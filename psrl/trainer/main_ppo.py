@@ -240,33 +240,59 @@ class TaskRunner:
         resource_num_per_bundle = {
             train_pool_id: train_bundle_resource_num,
         }
+        # Pools that intentionally host several workers per GPU raise this. Everything
+        # else keeps one worker per bundle.
+        max_colocate_per_pool: dict[str, int] = {}
 
         # Set the resource pool spec for each rollout instance.
         total_rollout_gpus = 0
+        dynamic_parallel_config = config.psrl.get("dynamic_parallel", None)
+        dynamic_parallel_enabled = dynamic_parallel_config is not None and dynamic_parallel_config.enable
         if deployment_config.elastic_rm.enable:
             rollout_pool_id_list = ["shared_rollout_pool"]
+        elif dynamic_parallel_enabled:
+            # Every TP degree's slots share one oversubscribed pool, because slots over
+            # the same GPUs must land on the same placement-group bundles. Slot pools are
+            # carved out of it in `ray_trainer.init_workers`.
+            rollout_pool_id_list = ["rollout_slot_pool"]
         else:
             rollout_pool_id_list = [f"rollout_pool_{i}" for i in range(deployment_config.n_rollout_instances)]
 
         # If heterogeneous rollout is enabled, we will use the heterogeneous rollout configuration.
         if deployment_config.heterogeneous_rollout.enable:
             heterogeneous_deployment_config = deployment_config.heterogeneous_rollout
-            assert (
-                len(heterogeneous_deployment_config.rollout_nnodes_per_instance)
-                == heterogeneous_deployment_config.n_rollout_instances
-            ), "The number of rollout nnodes per instance must match the number of rollout instances."
-            assert (
-                len(heterogeneous_deployment_config.rollout_ngpus_per_node_per_instance)
-                == heterogeneous_deployment_config.n_rollout_instances
-            ), "The number of rollout ngpus per node per instance must match the number of rollout instances."
-            assert (
-                len(heterogeneous_deployment_config.tensor_model_parallel_size_per_instance)
-                == heterogeneous_deployment_config.n_rollout_instances
-            ), "The number of tensor model parallel size per instance must match the number of rollout instances."
-            assert (
-                len(heterogeneous_deployment_config.pipeline_model_parallel_size_per_instance)
-                == heterogeneous_deployment_config.n_rollout_instances
-            ), "The number of pipeline model parallel size per instance must match the number of rollout instances."
+            n_instances = heterogeneous_deployment_config.n_rollout_instances
+            per_instance_lists = {
+                "rollout_nnodes_per_instance": heterogeneous_deployment_config.rollout_nnodes_per_instance,
+                "rollout_ngpus_per_node_per_instance": (
+                    heterogeneous_deployment_config.rollout_ngpus_per_node_per_instance
+                ),
+                "tensor_model_parallel_size_per_instance": (
+                    heterogeneous_deployment_config.tensor_model_parallel_size_per_instance
+                ),
+                "pipeline_model_parallel_size_per_instance": (
+                    heterogeneous_deployment_config.pipeline_model_parallel_size_per_instance
+                ),
+            }
+            for name, values in per_instance_lists.items():
+                assert len(values) == n_instances, (
+                    f"psrl.deployment.heterogeneous_rollout.{name} has {len(values)} entries but "
+                    f"n_rollout_instances is {n_instances}. Every instance needs exactly one entry."
+                )
+
+            # Each instance's GPUs must host its own parallelism. Checking here keeps
+            # the failure at config time rather than mid-bootstrap.
+            for i in range(n_instances):
+                tp = heterogeneous_deployment_config.tensor_model_parallel_size_per_instance[i]
+                pp = heterogeneous_deployment_config.pipeline_model_parallel_size_per_instance[i]
+                gpus_per_node = heterogeneous_deployment_config.rollout_ngpus_per_node_per_instance[i]
+                nnodes = heterogeneous_deployment_config.rollout_nnodes_per_instance[i]
+                instance_gpus = gpus_per_node * nnodes
+                assert tp >= 1 and pp >= 1, f"Rollout instance {i} has tp={tp} and pp={pp}. Both must be at least 1."
+                assert instance_gpus % (tp * pp) == 0, (
+                    f"Rollout instance {i} has {instance_gpus} GPUs ({gpus_per_node} per node x {nnodes} nodes), "
+                    f"which is not divisible by tp x pp = {tp * pp}."
+                )
 
             for i in range(deployment_config.n_rollout_instances):
                 rollout_pool_id = rollout_pool_id_list[i]
@@ -289,6 +315,34 @@ class TaskRunner:
                 deployment_config.elastic_rm.shared_ngpus_per_node
             ] * deployment_config.elastic_rm.shared_nnodes
             rollout_pool_id_list = ["shared_rollout_pool"]
+        elif dynamic_parallel_enabled:
+            from psrl.utils.gpu_topology import GPUSlot
+            from psrl.workers.gen.dynamic_parallel import build_slot_table
+
+            gpus_per_node = deployment_config.rollout_ngpus_per_node_per_instance
+            nnodes = deployment_config.rollout_nnodes_per_instance
+            tp_degrees = [int(tp) for tp in dynamic_parallel_config.tp_degrees]
+
+            # The pool holds the physical rollout GPUs once. Slot count comes from the
+            # table rather than from config, so the two can never disagree.
+            resource_pool_spec["rollout_slot_pool"] = [gpus_per_node] * nnodes
+            # A bundle still reserves one whole GPU. `max_colocate_count` is what lets the
+            # slots of different TP degrees share it, since vLLM only ever has one of them
+            # awake and Ray derives each actor's share as
+            # `resource_num_per_bundle / max_colocate_count`.
+            resource_num_per_bundle["rollout_slot_pool"] = 1.0
+            max_colocate_per_pool["rollout_slot_pool"] = len(set(tp_degrees))
+
+            node_layout = {
+                f"node{node_idx}": [GPUSlot(node_id=f"node{node_idx}", gpu_id=g) for g in range(gpus_per_node)]
+                for node_idx in range(nnodes)
+            }
+            slot_table = build_slot_table(node_layout, tp_degrees)
+            deployment_config.n_rollout_instances = len(slot_table)
+            psrl_logger.info(
+                f"[dynamic_parallel] TP degrees {sorted(set(tp_degrees))} over {gpus_per_node * nnodes} GPUs "
+                f"yield {len(slot_table)} replica slots, {len(set(tp_degrees))} engines per GPU."
+            )
         else:
             for i in range(deployment_config.n_rollout_instances):
                 rollout_pool_id = rollout_pool_id_list[i]
@@ -349,6 +403,7 @@ class TaskRunner:
             resource_pool_spec=resource_pool_spec,
             mapping=self.mapping,
             resource_num_per_bundle=resource_num_per_bundle,
+            max_colocate_per_pool=max_colocate_per_pool,
         )
 
         print(f"resource_pool_spec = {resource_pool_spec}, mapping = {self.mapping}")

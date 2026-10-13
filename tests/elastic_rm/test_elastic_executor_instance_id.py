@@ -1,142 +1,87 @@
-"""CPU tests: ElasticExecutor uses RolloutInstanceId keys throughout."""
+"""CPU tests: ElasticExecutor keys all of its state by RolloutInstanceId."""
 
-import enum as _enum
-import importlib.util
-import pathlib as _p
-import sys
 from unittest.mock import MagicMock
 
 import pytest
+from psrl.utils.elastic_rm.cluster_topology import ClusterTopology, GPUSlot, InstanceStatus
+from psrl.utils.elastic_rm.elastic_executor import ElasticExecutor
 
 pytestmark = pytest.mark.cpu_test
 
-_MOCKED = [
-    "ray",
-    "ray.actor",
-    "ray.util",
-    "ray.util.queue",
-    "torch",
-    "psrl.utils.logger",
-    "psrl.utils.common",
-    "psrl.utils.common.memory_utils",
-    "psrl.utils.server",
-    "psrl.utils.server.command",
-    "psrl.trainer.ppo.utils",
-    "psrl.utils.elastic_rm.scaling_policy",
-    "psrl.utils.elastic_rm.diagnostics",
-    "psrl.workers.gen.utils",
-]
-for _m in _MOCKED:
-    if _m not in sys.modules:
-        sys.modules[_m] = MagicMock()
-sys.modules["ray"].remote = lambda cls=None, **kw: (cls if cls is not None else lambda c: c)
-sys.modules["psrl.workers.gen.utils"].RolloutInstanceId = tuple
-
-
-class _InstanceStatus(_enum.Enum):
-    ASLEEP = _enum.auto()
-    AWAKEN = _enum.auto()
-
-
-_policy_mod = sys.modules["psrl.utils.elastic_rm.scaling_policy"]
-_policy_mod.InstanceStatus = _InstanceStatus
+ROLE = "rollout"
+MODEL = "test_model"
 
 
 class _FakePolicy:
     min_awake_per_role = 0
 
-    def decide(self, *a, **kw):
+    def decide(self, *args, **kwargs):
         return MagicMock(actions=[])
 
 
-_policy_mod.ScalingPolicy = lambda **kw: _FakePolicy()
-_policy_mod.InstanceSignal = MagicMock
-
-
-def _load(rel):
-    path = _p.Path("/Users/linsh/Desktop/verl_align/psrl") / rel
-    spec = importlib.util.spec_from_file_location(rel.replace("/", ".").removesuffix(".py"), path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_ee = _load("psrl/utils/elastic_rm/elastic_executor.py")
-ElasticExecutor = _ee.ElasticExecutor
-
-
 def _make_executor():
-    role = MagicMock()
-    model = "test_model"
-    coord = MagicMock()
-    ex = ElasticExecutor.__new__(ElasticExecutor)
-    ex.coordinators = {role: {model: coord}}
-    ex.roles = [(role, model)]
-    ex.instances_status_flags = {}
-    ex.instances_engine_stats = {}
-    ex.instance_gpu_mappings = {}
-    ex.gpu_to_instances = {}
-    ex.scaling_policy = _FakePolicy()
-    ex.elastic_rm_config = {}
-    ex._post_scale_up_abort_waiting_ratio = 0.0
-    ex._coordinator_command_timeout_s = None
-    ex._coordinator_sync_timeout_s = 60.0
-    ex._decision_execution_in_progress = False
-    ex._next_decision_id = 1
-    ex._decision_pending_action_counts = {}
-    ex._execution_in_progress_stall_ticks = 0
-    ex._decision_abandon_stall_ticks = 0
-    ex.router_backlog_by_role = {}
-    ex.trainer_waiting_hint = {}
-    ex._last_monitor_instance_log_ms = 0.0
-    ex._monitor_instance_log_interval_ms = 5000
-    ex._enable_monitor_instance_log = False
-    return ex, role, model
+    """Build an ElasticExecutor without running the Ray actor constructor."""
+    # `ray.remote` wraps the class, so reach the plain class behind the handle.
+    executor_cls = ElasticExecutor.__ray_metadata__.modified_class
+    executor = executor_cls.__new__(executor_cls)
+    executor.coordinators = {ROLE: {MODEL: MagicMock()}}
+    executor.roles = [(ROLE, MODEL)]
+    executor.instances_status_flags = {}
+    executor.instances_engine_stats = {}
+    executor.topology = ClusterTopology()
+    executor.scaling_policy = _FakePolicy()
+    executor.elastic_rm_config = {}
+    return executor
 
 
-def test_register_instances_accepts_rollout_instance_id_list():
-    """register_instances must accept list[RolloutInstanceId], not num_instances int."""
-    ex, role, model = _make_executor()
+def _slots(node_id, gpu_ids):
+    return frozenset(GPUSlot(node_id=node_id, gpu_id=g) for g in gpu_ids)
+
+
+def test_register_role_keys_state_by_instance_id_tuple():
+    executor = _make_executor()
     ids = [("wid-0", 0), ("wid-0", 1), ("wid-1", 0)]
-    ex.register_instances(role, model, ids)
-    assert ("wid-0", 0) in ex.instances_status_flags[role][model]
-    assert ("wid-0", 1) in ex.instances_status_flags[role][model]
-    assert ("wid-1", 0) in ex.instances_status_flags[role][model]
+    gpu_slots = [_slots("node1", [0]), _slots("node1", [1]), _slots("node1", [2])]
+
+    executor.register_role(ROLE, MODEL, ids, gpu_slots)
+
+    for instance_id in ids:
+        assert instance_id in executor.instances_status_flags[ROLE][MODEL]
+        assert executor.instances_status_flags[ROLE][MODEL][instance_id] == InstanceStatus.ASLEEP
 
 
-def test_register_instances_rejects_int():
-    """register_instances must NOT accept a plain integer (old API)."""
-    ex, role, model = _make_executor()
-    with pytest.raises((TypeError, AttributeError)):
-        ex.register_instances(role, model, 3)  # old API: int
+def test_register_role_rejects_mismatched_gpu_slot_count():
+    """A gpu_slots list of the wrong length is a caller bug, not a silent truncation."""
+    executor = _make_executor()
+    with pytest.raises(ValueError):
+        executor.register_role(ROLE, MODEL, [("wid-0", 0), ("wid-0", 1)], [_slots("node1", [0])])
 
 
-def test_register_instance_gpu_mapping_uses_tuple_key():
-    ex, role, model = _make_executor()
-    ids = [("wid-0", 0)]
-    ex.register_instances(role, model, ids)
-    ex.register_instance_gpu_mapping(role, model, ("wid-0", 0), gpu_ids=[0], node_id="node1")
-    mapping = ex.instance_gpu_mappings[role][model][("wid-0", 0)]
-    assert mapping["node_id"] == "node1"
-    assert mapping["gpu_ids"] == [0]
+def test_topology_records_gpu_placement_under_tuple_key():
+    executor = _make_executor()
+    executor.register_role(ROLE, MODEL, [("wid-0", 0)], [_slots("node1", [0, 1])])
+    assert executor.topology.get_gpu_slots(ROLE, MODEL, ("wid-0", 0)) == _slots("node1", [0, 1])
 
 
-def test_initialize_instance_states_with_tuple_ids():
-    ex, role, model = _make_executor()
-    ids = [("wid-0", 0), ("wid-1", 0)]
-    ex.register_instances(role, model, ids)
-    awaken = [{"role_name": role, "model_name": model, "instance_id": ("wid-0", 0)}]
-    ex.initialize_instance_states(awaken)
-    assert ex.instances_status_flags[role][model][("wid-0", 0)] == _ee.InstanceStatus.AWAKEN
-    assert ex.instances_status_flags[role][model][("wid-1", 0)] == _ee.InstanceStatus.ASLEEP
+def test_select_initial_awake_ids_skips_gpu_conflicts():
+    """Two instances sharing a GPU must not both be selected to wake."""
+    executor = _make_executor()
+    ids = [("wid-0", 0), ("wid-1", 0), ("wid-2", 0)]
+    # `wid-1` overlaps `wid-0` on GPU 0, so only one of them may wake.
+    gpu_slots = [_slots("node1", [0]), _slots("node1", [0]), _slots("node1", [1])]
+    executor.register_role(ROLE, MODEL, ids, gpu_slots)
+
+    selected = executor.select_initial_awake_ids(ROLE, MODEL, target_awake_num=3)
+
+    assert ("wid-0", 0) in selected
+    assert ("wid-1", 0) not in selected
+    assert ("wid-2", 0) in selected
+    for instance_id in selected:
+        assert executor.instances_status_flags[ROLE][MODEL][instance_id] == InstanceStatus.AWAKEN
 
 
-def test_sync_engine_status_stores_tuple_key():
-    """Engine stats can be stored and retrieved with RolloutInstanceId tuple key."""
-    ex, role, model = _make_executor()
-    ids = [("wid-0", 0)]
-    ex.register_instances(role, model, ids)
-    role_stats = ex.instances_engine_stats.setdefault(role, {}).setdefault(model, {})
-    snapshot = {"instance_id": ("wid-0", 0), "scheduler_stats": {}, "generation_throughput": 0.0}
-    role_stats[("wid-0", 0)] = snapshot
-    assert ("wid-0", 0) in ex.instances_engine_stats[role][model]
+def test_engine_stats_stored_under_tuple_key():
+    executor = _make_executor()
+    executor.register_role(ROLE, MODEL, [("wid-0", 0)], [_slots("node1", [0])])
+    executor.instances_engine_stats[ROLE][MODEL][("wid-0", 0)] = {"scheduler_stats": {}}
+    assert ("wid-0", 0) in executor.instances_engine_stats[ROLE][MODEL]

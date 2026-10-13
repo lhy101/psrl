@@ -1,9 +1,16 @@
 # Whether to use torch_memory_saver (TMS) for GPU management
 
-# `null` disables TMS, `train` enables train workers, and `all` enables every worker.
+# `null` disables TMS, `train` enables train workers, `gen` enables rollout workers,
+# and `all` enables every worker.
+#
+# Megatron offloads optimizer and gradient state with a plain device-to-host copy
+# (`offload_tensor_to_cpu`), which fails with `cudaErrorInvalidValue` on a TMS-managed
+# region. So a run that offloads on the train side and needs TMS on the rollout side
+# must use `gen` rather than `all`.
 range: null
 
-# Release CUDA graphs when TMS is enabled for all workers.
+# Release CUDA graphs when TMS is enabled for rollout workers. Requires `range` to be
+# `gen` or `all`, since the patch is installed on the rollout worker.
 enable_cuda_graph: False
 
 # Release NIXL temporary buffers to reduce GPU memory.

@@ -1,3 +1,16 @@
+# Mixed-TP heterogeneous rollout: one TP-2 replica alongside two TP-1 replicas.
+#
+# The slot table on a 4-GPU pool with tp_degrees=[1,2]:
+#   slot 0 = TP-2, GPUs 0-1
+#   slot 1 = TP-2, GPUs 2-3
+#   slots 2-5 = TP-1, one GPU each
+#
+# slot_schedule alternates between two mixed awake sets:
+#   v0,v2,... -> [0,4,5]: slot 0 (TP-2, GPUs 0-1) + slots 4,5 (TP-1, GPUs 2,3)
+#   v1,v3,... -> [1,2,3]: slot 1 (TP-2, GPUs 2-3) + slots 2,3 (TP-1, GPUs 0,1)
+#
+# The TP-2 replica handles latency-sensitive old-version trajectories; the two
+# TP-1 replicas fill throughput. This is the SCG §9.2 asymmetry verified live.
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
@@ -12,44 +25,35 @@ test_files=/jizhicfs/lhy/data/dapo/aime-2024.parquet
 OUTPUT_DIR=${PSRL_PATH}/examples/dapo_trainer/output
 mkdir -p "$OUTPUT_DIR"
 project_name=simulate
-experiment_name=qwen3_8b_megatron_probe
+experiment_name=qwen3_8b_dynamic_parallel_mixed_tp
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/"${project_name}"/"${experiment_name}"
 LOG_DIR=${OUTPUT_DIR}/logs/$(date +%Y%m%d_%H%M%S)
-
 
 mkdir -p "$LOG_DIR"
 mkdir -p "$CKPTS_DIR"
 
-
 train_batch_size=8
-# train_batch_size=60
-tensor_model_parallel_size=2
-pipeline_model_parallel_size=3
-rollout_tensor_model_parallel_size=1
+max_prompt_length=1024
+max_response_length=10240
 rollout_N=8
 nnodes=1
 
-GEN_DP=1
 GEN_TP=1
 GEN_PP=1
 
-VAL_DP=1
 VAL_TP=1
 VAL_PP=1
 
 GEN_NNODES=1
-GEN_NGPUS_PER_NODE=2
-GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
-GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
+GEN_NGPUS_PER_NODE=4
+GEN_INSTANCES=1
+GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} ))
 
 TRAIN_NNODES=1
-TRAIN_NGPUS_PER_NODE=6
+TRAIN_NGPUS_PER_NODE=4
 
-VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
-VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
-
-# Requires vLLM 0.11 or newer, Megatron-LM 0.13 or newer, and the `qwen3vl_cp` MBridge branch.
- 
+VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) ))
+VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} ))
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -62,13 +66,13 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
-    psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
+    psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE} \
     psrl.deployment.n_validate_instances=${VAL_INSTANCES} \
     psrl.deployment.validate_nnodes_per_instance=1 \
     psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
-    psrl.nixl.server_port=27237 \
+    psrl.nixl.server_port=27238 \
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \
@@ -76,8 +80,8 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=$train_batch_size \
-    data.max_prompt_length=1024 \
-    data.max_response_length=10240 \
+    data.max_prompt_length=${max_prompt_length} \
+    data.max_response_length=${max_response_length} \
     data.filter_overlong_prompts=False \
     data.truncation='left' \
     \
@@ -90,7 +94,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     train_actor_rollout_ref.actor.kl_loss_coef=0.01 \
     train_actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
-    train_actor_rollout_ref.actor.rollout_n=$rollout_N \
+    train_actor_rollout_ref.actor.rollout_n=8 \
     train_actor_rollout_ref.actor.use_dynamic_bsz=True \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12800 \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
@@ -99,29 +103,26 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     train_actor_rollout_ref.actor.megatron.param_offload=False \
     train_actor_rollout_ref.actor.megatron.grad_offload=True \
     train_actor_rollout_ref.actor.megatron.optimizer_offload=True \
-    train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=$tensor_model_parallel_size \
-    train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=$pipeline_model_parallel_size \
+    train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2 \
+    train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=2 \
     train_actor_rollout_ref.actor.megatron.context_parallel_size=1 \
     train_actor_rollout_ref.actor.megatron.vanilla_mbridge=False \
-    \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    train_actor_rollout_ref.rollout.data_parallel_size=${VAL_DP} \
-    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
-    train_actor_rollout_ref.rollout.pipeline_model_parallel_size=${VAL_PP} \
+    train_actor_rollout_ref.rollout.data_parallel_size=1 \
+    train_actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    train_actor_rollout_ref.rollout.pipeline_model_parallel_size=1 \
     train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=12800 \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=12800 \
-    \
     gen_actor_rollout_ref.rollout.name=vllm \
-    gen_actor_rollout_ref.rollout.data_parallel_size=${GEN_DP} \
-    gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
-    gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
-    gen_actor_rollout_ref.rollout.n=$rollout_N \
-    gen_actor_rollout_ref.rollout.max_num_batched_tokens=12800\
-    \
+    gen_actor_rollout_ref.rollout.data_parallel_size=1 \
+    gen_actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=1 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
+    gen_actor_rollout_ref.rollout.n=8 \
+    gen_actor_rollout_ref.rollout.max_num_batched_tokens=12800 \
     train_actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     \
@@ -132,20 +133,28 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     \
     psrl.rollout_coordination.sync_and_mig_strategy.method="greedy" \
     \
+    psrl.dynamic_parallel.enable=True \
+    psrl.dynamic_parallel.tp_degrees='[1,2]' \
+    psrl.dynamic_parallel.planner=scripted \
+    "psrl.dynamic_parallel.slot_schedule=[[0,4,5],[1,2,3]]" \
+    psrl.dynamic_parallel.switch_on_boundary=True \
+    psrl.tms.range=gen \
+    psrl.tms.enable_cuda_graph=True \
+    \
     psrl.rollout_coordination.partial_rollout.enable=True \
     \
-    psrl.colocate_validate_and_train=True \
+    psrl.colocate_validate_and_train=False \
     \
     reward.launch_reward_fn_async=True \
     \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.val_before_train=False \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.total_training_steps=2 \
+    trainer.total_training_steps=3 \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.total_epochs=15 $@ 2>&1 | tee "train_probe.log"
+    trainer.total_epochs=15 $@ 2>&1 | tee "train_dynamic_parallel_mixed_tp.log"

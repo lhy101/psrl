@@ -1,47 +1,15 @@
 """CPU tests: ScalingPolicy and InstanceSignal use RolloutInstanceId."""
 
-import importlib.util
-import os
-import sys
-from unittest.mock import MagicMock
-
 import pytest
+from psrl.utils.elastic_rm.scaling_policy import (
+    InstanceSignal,
+    ScalingAction,
+    ScalingPolicy,
+    ThroughputProfileLoader,
+)
+from psrl.workers.gen.utils import RolloutInstanceId
 
 pytestmark = pytest.mark.cpu_test
-
-# --- Bootstrap Without Ray or Torch Imports ---
-
-_PSRL = os.path.join(os.path.dirname(__file__), "../../psrl")
-
-
-def _load_direct(dotted_name: str, rel_path: str) -> object:
-    """Always load the real .py file, replacing any mock that may have been registered."""
-    path = os.path.join(_PSRL, rel_path)
-    spec = importlib.util.spec_from_file_location(dotted_name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[dotted_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-# Stub out modules that pull in ray or torch.
-for _m in ["ray", "ray.actor", "ray.util", "ray.util.queue", "torch", "torch.distributed"]:
-    if _m not in sys.modules:
-        sys.modules[_m] = MagicMock()
-
-if "psrl.utils.logger" not in sys.modules:
-    sys.modules["psrl.utils.logger"] = MagicMock()
-
-# Load gen.utils directly (real module, provides RolloutInstanceId).
-_utils_mod = _load_direct("psrl.workers.gen.utils", "workers/gen/utils.py")
-RolloutInstanceId = _utils_mod.RolloutInstanceId
-
-# Load scaling_policy directly (real module under test).
-_sp_mod = _load_direct("psrl.utils.elastic_rm.scaling_policy", "utils/elastic_rm/scaling_policy.py")
-InstanceSignal = _sp_mod.InstanceSignal
-ScalingAction = _sp_mod.ScalingAction
-ScalingPolicy = _sp_mod.ScalingPolicy
-ThroughputProfileLoader = _sp_mod.ThroughputProfileLoader
 
 
 # --- Helpers ---

@@ -111,4 +111,5 @@ markers = [
     "docs: marks tests related to documentation",
     "skipduringci: marks tests skipped in CI but useful for user setups",
     "pleasefixme: marks tests that are broken and need fixing",
+    "docker_test: marks tests that start real containers (needs a working Docker daemon)",
 ]

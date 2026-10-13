@@ -1,101 +1,55 @@
-"""CPU tests for RewardModelGateway router args construction."""
+"""CPU tests for the reward-model gateway's router configuration.
 
-import importlib.util
-import pathlib
-import sys
-import types as _types
-from unittest.mock import MagicMock
+`RewardModelGateway` is a Ray actor, so its routing policy is asserted through
+`build_reward_router_args`, the plain function `_init_router_args` delegates to.
+"""
 
 import pytest
 from omegaconf import OmegaConf
+from psrl.workers.gen.smg_adapter import build_reward_router_args
 
 pytestmark = pytest.mark.cpu_test
 
-# Stub heavy runtime dependencies so the gateway can be imported in CPU tests.
 
-_MOCKED_MODULES = [
-    "ray",
-    "ray.util",
-    "ray.util.queue",
-    "torch",
-    "torch.distributed",
-    "vllm",
-    "vllm.engine",
-    # Stub out psrl.utils.logger so we don't pull in verl/tensordict/torch
-    "psrl.utils.logger",
-    "psrl.utils.common",
-    "psrl.utils.common.http_utils",
-    "smg",
-    "smg.launch_router",
-]
-
-for _mod in _MOCKED_MODULES:
-    if _mod not in sys.modules:
-        sys.modules[_mod] = MagicMock()
-
-# Make ray.remote a pass-through decorator
-sys.modules["ray"].remote = lambda cls=None, **kwargs: (cls if cls is not None else lambda c: c)
-
-# Provide a real find_available_port stub that returns a port integer
-sys.modules["psrl.utils.common.http_utils"].find_available_port = lambda base_port=8000: base_port
-
-# Provide DualOutputHandler stub
-sys.modules["psrl.utils.logger"].DualOutputHandler = MagicMock(return_value=MagicMock())
-
-# Return the argparse namespace from RouterArgs.from_cli_args so this CPU test can
-# inspect the values without importing the Rust extension.
-sys.modules["smg.launch_router"].RouterArgs.from_cli_args = lambda args, use_router_prefix=False: args
-
-_rm_pkg = _types.ModuleType("psrl.workers.reward.reward_model")
-_rm_pkg.RewardModelManager = MagicMock()
-_rm_pkg.RewardModelReplica = MagicMock()
-sys.modules["psrl.workers.reward.reward_model"] = _rm_pkg
-
-_gateway_path = (
-    pathlib.Path(__file__).parent.parent.parent.parent / "psrl" / "workers" / "reward" / "reward_model" / "gateway.py"
-)
-_spec = importlib.util.spec_from_file_location("psrl.workers.reward.reward_model.gateway", _gateway_path)
-_gateway_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_gateway_mod)
-RewardModelGateway = _gateway_mod.RewardModelGateway
+def _args(**overrides):
+    config = OmegaConf.create({"psrl": {"logging_path": "/tmp/psrl_test_logs"}})
+    kwargs = {"host": "127.0.0.1", "port": 8300, "prometheus_port": None}
+    kwargs.update(overrides)
+    return build_reward_router_args(config, **kwargs)
 
 
-def _make_config():
-    return OmegaConf.create(
-        {
-            "psrl": {
-                "logging_path": "/tmp/psrl_test_logs",
-            }
-        }
-    )
-
-
-def test_gateway_init():
-    """RewardModelGateway can be instantiated with config + model_name."""
-    cfg = _make_config()
-    gw = RewardModelGateway.__new__(RewardModelGateway)
-    gw.__init__(cfg, "TestRM")
-    assert gw.model_name == "TestRM"
-    assert gw.smg_url is None
-
-
-def test_gateway_router_args_policy():
-    """_init_router_args sets policy to round_robin and disables PSRL routing."""
-    cfg = _make_config()
-    gw = RewardModelGateway.__new__(RewardModelGateway)
-    gw.__init__(cfg, "TestRM")
-    gw.smg_ip = "127.0.0.1"
-    gw.smg_port = 8300
-
-    args = gw._init_router_args()
+def test_router_uses_round_robin_without_psrl_routing():
+    """A reward model has no model-version gating, so PSRL worker selection is wrong for it."""
+    args = _args()
     assert args.policy == "round_robin"
     assert args.enable_routing_loop is False
     assert args.worker_selection_strategy == "naive"
 
 
-def test_gateway_shutdown_noop_when_not_started():
-    """shutdown_router is a no-op when router was never started."""
-    cfg = _make_config()
-    gw = RewardModelGateway.__new__(RewardModelGateway)
-    gw.__init__(cfg, "TestRM")
-    gw.shutdown_router()  # must not raise
+def test_router_is_not_dp_aware():
+    """Reward replicas are addressed as whole workers, not per dp rank."""
+    assert _args().dp_aware is False
+
+
+def test_router_disables_pd_disaggregation():
+    """Reward scoring is a single forward pass, so there is no prefill/decode split."""
+    args = _args()
+    assert args.pd_disaggregation is False
+    assert not args.prefill_urls
+    assert not args.decode_urls
+
+
+def test_router_binds_the_requested_host_and_port():
+    args = _args(host="10.0.0.5", port=9999)
+    assert args.host == "10.0.0.5"
+    assert args.port == 9999
+
+
+def test_prometheus_port_is_passed_through():
+    assert _args(prometheus_port=4100).prometheus_port == 4100
+    assert _args(prometheus_port=None).prometheus_port is None
+
+
+def test_router_uses_grpc_connection_mode():
+    """PSRL serves vLLM over gRPC, so the reward router must match."""
+    assert _args().connection_mode == "grpc"

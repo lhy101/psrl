@@ -106,6 +106,10 @@ class StatusMixin:
         """Periodically snapshot per-replica stats to JSONL files."""
         psrl_logger.info("Starting stats recorder loop")
         interval = self.config.psrl.status_collection.stats_recorder.interval_in_s
+        # Replicas finish registering after the coordinator is constructed, so the
+        # registry is only complete here. Analysis tools key off it to label a
+        # stats file with its role and TP degree.
+        self._stats_recorder.write_instance_registry(self.build_stats_instance_registry())
         while not self.stop_stats_recorder:
             await asyncio.sleep(interval)
             if not self.stop_stats_recorder:

@@ -16,6 +16,8 @@ from psrl.utils.common.http_utils import find_available_port, get_host_info
 from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.logger import DualOutputHandler
 from psrl.utils.server.command import CommandExtension
+from psrl.workers.gen.dynamic_parallel import switch as dynamic_parallel_switch_module
+from psrl.workers.gen.dynamic_parallel.switch import SwitchMixin
 from psrl.workers.gen.smg_adapter import (
     ROUTING_LOOP_STATUS_PATH,
     WORKERS_STATS_PATH,
@@ -49,6 +51,7 @@ _LOG_FILE_TO_MODULE_LOGGERS = {
         sync_and_migrate_module.psrl_logger,
         greedy_module.psrl_logger,
         status_based_module.psrl_logger,
+        dynamic_parallel_switch_module.psrl_logger,
     ],
     "Status": [status_loop_module.psrl_logger],
     "SessionStrategy": [thunder_agent_module.psrl_logger],
@@ -62,6 +65,7 @@ class RolloutCoordinator(
     GreedySyncMixin,
     StatusBasedSyncMixin,
     ThunderAgentSessionMixin,
+    SwitchMixin,
     CoordinatorBase,
     CommandExtension,
 ):
@@ -125,6 +129,15 @@ class RolloutCoordinator(
         self.status_sink_endpoint = f"tcp://{status_host}:{status_port}"
         self.status_queue = ZMQPullQueue(endpoint=self.status_sink_endpoint)
         self.replica_idx_to_replica_id: dict[int, str] = {}
+
+        # Dynamic parallelism. `slot_to_replica_id` is populated by `add_worker` and
+        # `awake_set` is installed by `set_replica_slot_table` once the table exists.
+        # Both stay empty when the feature is disabled.
+        self.slot_to_replica_id: dict[int, str] = {}
+        self.slot_to_cohort: dict[int, str] = {}
+        self.awake_set = None
+        self.cohort_planner = None
+        self._pending_switch_version: int | None = None
 
         # Background event handler
         self.running_loop = None
@@ -234,6 +247,7 @@ class RolloutCoordinator(
         dp_size: int,
         is_validate: bool = False,
         model_version: int = 0,
+        slot_id: int | None = None,
     ):
         """Add a rollout replica to the coordinator.
 
@@ -242,12 +256,18 @@ class RolloutCoordinator(
             server_handle: Handle to the rollout replica actor
             replica_id (str): ID of the rollout replica
             dp_size (int): Number of instances in the rollout replica
+            is_validate (bool): Whether this replica serves validation.
+            model_version (int): Version the replica starts at.
+            slot_id (int | None): Replica slot this replica fills under dynamic
+                parallelism. None when the feature is disabled.
         """
         self.rollout_replicas[replica_id] = rollout_replica
         self.server_handles[replica_id] = server_handle
         self.replica_ids.add(replica_id)
         self.instance_ids.update([(replica_id, i) for i in range(dp_size)])
         self.replica_idx_to_replica_id[rollout_replica.replica_rank] = replica_id
+        if slot_id is not None:
+            self.slot_to_replica_id[slot_id] = replica_id
 
         tag = "validate" if is_validate else "rollout"
         self.tag_to_replica_ids[tag].add(replica_id)
@@ -266,6 +286,83 @@ class RolloutCoordinator(
 
     def get_status_sink_endpoint(self) -> str:
         return self.status_sink_endpoint
+
+    def set_replica_slot_table(self, table, initially_awake_slot_ids: list[int] | None = None) -> None:
+        """Install the replica slot table and seed the awake set.
+
+        Called once after staged bootstrap, which knows the table and which slots
+        it left awake. The awake set must start from the realized GPU state rather
+        than from empty, or the first switch would try to sleep nothing and wake
+        slots that are already up.
+
+        Args:
+            table: The `ReplicaSlotTable` built for the rollout pool.
+            initially_awake_slot_ids: Slots left awake by bootstrap.
+        """
+        from psrl.workers.gen.dynamic_parallel import AwakeSet, SlotTransition, build_cohort_planner
+
+        self.awake_set = AwakeSet(table)
+        self.cohort_planner = build_cohort_planner(self.config.psrl.dynamic_parallel)
+        if initially_awake_slot_ids:
+            awake = tuple(table.by_id[slot_id] for slot_id in sorted(initially_awake_slot_ids))
+            self.awake_set.commit(SlotTransition(to_sleep=(), to_wake=awake, unchanged=()))
+        psrl_logger.info(
+            f"Installed replica slot table with {len(table)} slots and planner {self.cohort_planner!r}. "
+            f"Awake: {sorted(self.awake_set.current_ids())}."
+        )
+
+    def get_awake_slot_ids(self) -> list[int]:
+        """Slot ids currently awake, or an empty list when dynamic parallelism is off."""
+        if self.awake_set is None:
+            return []
+        return sorted(self.awake_set.current_ids())
+
+    def build_stats_instance_registry(self) -> list[dict]:
+        """Describe every stats file so analysis tools need not parse filenames.
+
+        A name like `stats_r3_dp0.jsonl` cannot say whether replica 3 serves
+        rollout or validation, nor what TP degree it runs, and under dynamic
+        parallelism the TP degree differs between replicas. This maps each file
+        to that metadata.
+
+        Returns:
+            list[dict]: One entry per instance, each carrying `stats_file`,
+                `replica_idx`, `dp_rank`, `tag`, `tp`, `tag_index`, `slot_id`,
+                and a display `label`.
+        """
+        replica_id_to_slot = {replica_id: slot_id for slot_id, replica_id in self.slot_to_replica_id.items()}
+        entries = []
+        for replica_id, replica in self.rollout_replicas.items():
+            tag = "validate" if replica_id in self.tag_to_replica_ids["validate"] else "rollout"
+            slot_id = replica_id_to_slot.get(replica_id)
+            tp = getattr(replica, "tensor_parallel_size", None)
+            if tp is None and self.awake_set is not None and slot_id is not None:
+                slot = self.awake_set.table.by_id.get(slot_id)
+                tp = slot.tp if slot is not None else None
+            for dp_rank in range(getattr(replica, "data_parallel_size", 1)):
+                entries.append(
+                    {
+                        "stats_file": f"stats_r{replica.replica_rank}_dp{dp_rank}.jsonl",
+                        "replica_idx": replica.replica_rank,
+                        "dp_rank": dp_rank,
+                        "tag": tag,
+                        "tp": tp,
+                        "slot_id": slot_id,
+                    }
+                )
+        # Number each tag independently so a reader sees "rollout 0..n" rather than
+        # a replica_rank that counts rollout and validate replicas together.
+        for tag in ("rollout", "validate"):
+            tagged = sorted(
+                (entry for entry in entries if entry["tag"] == tag),
+                key=lambda entry: (entry["replica_idx"], entry["dp_rank"]),
+            )
+            for tag_index, entry in enumerate(tagged):
+                entry["tag_index"] = tag_index
+                tp_part = f" TP{entry['tp']}" if entry["tp"] else ""
+                slot_part = f" slot{entry['slot_id']}" if entry["slot_id"] is not None else ""
+                entry["label"] = f"{tag}{tag_index}{tp_part}{slot_part}"
+        return sorted(entries, key=lambda entry: (entry["tag"], entry["replica_idx"], entry["dp_rank"]))
 
     def get_all_instance_ids(self) -> list:
         """Return all registered (replica_id, dp_rank) instance IDs, sorted for determinism."""
@@ -363,11 +460,26 @@ class RolloutCoordinator(
         await asyncio.gather(*futures)
 
     async def initial_pull_from_ps(self, tag: str = "rollout") -> None:
-        futures = [server_handle.pull_model.remote() for server_handle in self._tag_to_server(tag)]
+        pulled_replica_ids = self.replica_ids if tag == "all" else self.tag_to_replica_ids[tag]
+        if self.awake_set is not None:
+            # A sleeping slot has no mapped weights to pull into, and marking it current
+            # would let the sync loop skip it when it is later woken. Restrict to awake.
+            awake_replica_ids = {
+                self.slot_to_replica_id[slot.slot_id]
+                for slot in self.awake_set.current()
+                if slot.slot_id in self.slot_to_replica_id
+            }
+            pulled_replica_ids = {
+                replica_id
+                for replica_id in pulled_replica_ids
+                if replica_id in awake_replica_ids or replica_id in self.tag_to_replica_ids["validate"]
+            }
+        futures = [
+            self.server_handles[replica_id].pull_model.remote() for replica_id in sorted(pulled_replica_ids)
+        ]
         await asyncio.gather(*futures)
         psrl_logger.info(f"Initial parameter server pull complete: replicas={len(futures)}, tag={tag!r}.")
         # Pulled replicas must advertise the parameter server version to the gateway.
-        pulled_replica_ids = self.replica_ids if tag == "all" else self.tag_to_replica_ids[tag]
         pulled_instance_ids = [inst_id for inst_id in self.instance_ids if inst_id[0] in pulled_replica_ids]
         for instance_id in pulled_instance_ids:
             self.instance_to_model_version[instance_id] = self.ps_model_version
@@ -551,7 +663,24 @@ class RolloutCoordinator(
                 "PS model version must be greater than the ready buffers."
             )
             self.ready_buffers.remove(self.ps_model_version - 1)
+        # A weight update is the only safe moment to re-solve parallelism, because the KV
+        # is discarded anyway. This setter is sync and called fire-and-forget from the PS,
+        # so record the boundary and let the sync loop await the switch.
+        if self.awake_set is not None:
+            self._pending_switch_version = version
         psrl_logger.info(f"Updated PS model version to {version}")
+
+    async def consume_pending_parallelism_switch(self) -> None:
+        """Apply a parallelism replan recorded by `set_ps_model_version`, if any."""
+        version = self._pending_switch_version
+        psrl_logger.warning(
+            f"consume_pending_parallelism_switch: pending={version!r}, "
+            f"awake_set={self.awake_set is not None}, planner={self.cohort_planner!r}."
+        )
+        if version is None:
+            return
+        self._pending_switch_version = None
+        await self.replan_parallelism(version)
 
     def init_ps_model_version(self, version: int):
         """

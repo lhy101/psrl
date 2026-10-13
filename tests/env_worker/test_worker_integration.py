@@ -2,6 +2,8 @@
 Integration tests that start real containers.
 
 Skipped automatically when Docker is unavailable or no local image exists.
+Marked `docker_test` so a CPU-only run deselects them without probing Docker,
+which matters because a wedged daemon makes `docker images` hang.
 """
 
 import asyncio
@@ -12,15 +14,25 @@ import pytest
 from psrl.workers.env_worker.sandbox import SandboxSpec
 from psrl.workers.env_worker.worker import EnvWorker
 
+# Probing Docker at import time would block collection on a wedged daemon, so
+# the lookup is deferred into a fixture and bounded by a timeout.
+pytestmark = pytest.mark.docker_test
+
+_DOCKER_PROBE_TIMEOUT_S = 10.0
+
 
 def _first_local_image() -> str | None:
     if shutil.which("docker") is None:
         return None
-    completed = subprocess.run(
-        ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+            capture_output=True,
+            text=True,
+            timeout=_DOCKER_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if completed.returncode != 0:
         return None
     for line in completed.stdout.splitlines():
@@ -29,17 +41,21 @@ def _first_local_image() -> str | None:
     return None
 
 
-IMAGE = _first_local_image()
-requires_docker = pytest.mark.skipif(IMAGE is None, reason="Docker or a local image is unavailable.")
+@pytest.fixture(scope="module")
+def local_image() -> str:
+    """Name a local image to run against, or skip the whole module."""
+    image = _first_local_image()
+    if image is None:
+        pytest.skip("Docker or a local image is unavailable.")
+    return image
 
 
-@requires_docker
-def test_shell_state_persists_across_exec_calls():
+def test_shell_state_persists_across_exec_calls(local_image):
     """State set by one exec must be visible to the next, which docker exec cannot do."""
 
     async def scenario() -> None:
         worker = EnvWorker(worker_id=0, cpu_slots=1, gpu_slots=0, exec_default_timeout_s=60.0)
-        sandbox_id = await worker.create_sandbox(SandboxSpec(image=IMAGE, network="none"))
+        sandbox_id = await worker.create_sandbox(SandboxSpec(image=local_image, network="none"))
         try:
             await worker.exec(sandbox_id, "cd /tmp", timeout_s=30.0)
             await worker.exec(sandbox_id, "export PSRL_MARKER=persisted", timeout_s=30.0)
@@ -54,11 +70,10 @@ def test_shell_state_persists_across_exec_calls():
     asyncio.run(scenario())
 
 
-@requires_docker
-def test_nonzero_exit_code_is_reported():
+def test_nonzero_exit_code_is_reported(local_image):
     async def scenario() -> None:
         worker = EnvWorker(worker_id=0, cpu_slots=1, gpu_slots=0, exec_default_timeout_s=60.0)
-        sandbox_id = await worker.create_sandbox(SandboxSpec(image=IMAGE, network="none"))
+        sandbox_id = await worker.create_sandbox(SandboxSpec(image=local_image, network="none"))
         try:
             # NOTE(claude): Using a subshell `(exit N)` keeps the persistent shell alive.
             # A bare `exit N` would terminate the shell process, ending the container.
@@ -70,11 +85,10 @@ def test_nonzero_exit_code_is_reported():
     asyncio.run(scenario())
 
 
-@requires_docker
-def test_file_round_trip():
+def test_file_round_trip(local_image):
     async def scenario() -> None:
         worker = EnvWorker(worker_id=0, cpu_slots=1, gpu_slots=0, exec_default_timeout_s=60.0)
-        sandbox_id = await worker.create_sandbox(SandboxSpec(image=IMAGE, network="none"))
+        sandbox_id = await worker.create_sandbox(SandboxSpec(image=local_image, network="none"))
         try:
             payload = b"col_a,col_b\n1,2\n"
             await worker.write_file(sandbox_id, "/tmp/submission.csv", payload)
@@ -87,11 +101,10 @@ def test_file_round_trip():
     asyncio.run(scenario())
 
 
-@requires_docker
-def test_read_file_returns_raw_bytes_not_tar():
+def test_read_file_returns_raw_bytes_not_tar(local_image):
     async def scenario() -> None:
         worker = EnvWorker(worker_id=0, cpu_slots=1, gpu_slots=0, exec_default_timeout_s=60.0)
-        sandbox_id = await worker.create_sandbox(SandboxSpec(image=IMAGE, network="none"))
+        sandbox_id = await worker.create_sandbox(SandboxSpec(image=local_image, network="none"))
         try:
             payload = b"col_a,col_b\n1,2\n"
             await worker.write_file(sandbox_id, "/tmp/submission.csv", payload)
@@ -104,8 +117,7 @@ def test_read_file_returns_raw_bytes_not_tar():
     asyncio.run(scenario())
 
 
-@requires_docker
-def test_timed_out_command_does_not_leak_into_the_next_observation():
+def test_timed_out_command_does_not_leak_into_the_next_observation(local_image):
     """
     Regression test for a verified bug. A command that times out keeps running and
     later emits its output plus a sentinel. Without a drain before each exec, that
@@ -116,7 +128,7 @@ def test_timed_out_command_does_not_leak_into_the_next_observation():
 
     async def scenario() -> None:
         worker = EnvWorker(worker_id=0, cpu_slots=1, gpu_slots=0, exec_default_timeout_s=60.0)
-        sandbox_id = await worker.create_sandbox(SandboxSpec(image=IMAGE, network="none"))
+        sandbox_id = await worker.create_sandbox(SandboxSpec(image=local_image, network="none"))
         try:
             timed_out = await worker.exec(sandbox_id, "sleep 3; echo LATE_LEAK", timeout_s=1.0)
             assert timed_out.timed_out, "The slow command should have timed out."
@@ -135,11 +147,10 @@ def test_timed_out_command_does_not_leak_into_the_next_observation():
     asyncio.run(scenario())
 
 
-@requires_docker
-def test_destroy_removes_the_container():
+def test_destroy_removes_the_container(local_image):
     async def scenario() -> str:
         worker = EnvWorker(worker_id=0, cpu_slots=1, gpu_slots=0, exec_default_timeout_s=60.0)
-        sandbox_id = await worker.create_sandbox(SandboxSpec(image=IMAGE, network="none"))
+        sandbox_id = await worker.create_sandbox(SandboxSpec(image=local_image, network="none"))
         await worker.destroy_sandbox(sandbox_id)
         return f"psrl-env-{sandbox_id}"
 

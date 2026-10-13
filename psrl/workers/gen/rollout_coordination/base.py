@@ -61,3 +61,24 @@ class CoordinatorBase:
         """
         data = await self._gateway_get_json("/routing_loop/status")
         return bool(data.get("selecting", False))
+
+    def is_syncable_instance(self, instance_id) -> bool:
+        """Whether an instance is a weight-sync candidate right now.
+
+        Validate instances never sync. Under dynamic parallelism a replica slot
+        that is asleep also never syncs, because its weights are unmapped and
+        pulling into them would fail. Sleeping is a normal state here rather than
+        a fault, so the sync loops skip these instances instead of treating them
+        as stuck.
+        """
+        replica_id, _ = instance_id
+        if replica_id not in self.tag_to_replica_ids["rollout"]:
+            return False
+        if self.awake_set is None:
+            return True
+        awake_replica_ids = {
+            self.slot_to_replica_id[slot.slot_id]
+            for slot in self.awake_set.current()
+            if slot.slot_id in self.slot_to_replica_id
+        }
+        return replica_id in awake_replica_ids

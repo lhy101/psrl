@@ -1,3 +1,12 @@
+# End-to-end check for dynamic heterogeneous rollout parallelism.
+#
+# The rollout pool gets its own 4 GPUs and materializes TP-1 and TP-2 slots over
+# them, so 6 replica slots and 2 engines per GPU. `tp_schedule` alternates the two
+# degrees by model version, which drives a real switch at every weight update
+# without needing a solver.
+#
+# CUDA graphs stay on. TMS pauses and resumes the graph region, which is what makes
+# a slot switchable. See psrl/workers/gen/dynamic_parallel/FINDINGS.md.
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
@@ -12,7 +21,7 @@ test_files=/jizhicfs/lhy/data/dapo/aime-2024.parquet
 OUTPUT_DIR=${PSRL_PATH}/examples/dapo_trainer/output
 mkdir -p "$OUTPUT_DIR"
 project_name=simulate
-experiment_name=qwen3_8b_megatron_loopback_fix
+experiment_name=qwen3_8b_dynamic_parallel
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/"${project_name}"/"${experiment_name}"
 LOG_DIR=${OUTPUT_DIR}/logs/$(date +%Y%m%d_%H%M%S)
 
@@ -21,12 +30,12 @@ mkdir -p "$LOG_DIR"
 mkdir -p "$CKPTS_DIR"
 
 
-train_batch_size=32
+train_batch_size=8
 # train_batch_size=60
 max_prompt_length=1024
 max_response_length=10240
 tensor_model_parallel_size=2
-pipeline_model_parallel_size=3
+pipeline_model_parallel_size=2
 rollout_tensor_model_parallel_size=1
 rollout_N=8
 nnodes=1
@@ -40,12 +49,13 @@ VAL_TP=1
 VAL_PP=1
 
 GEN_NNODES=1
-GEN_NGPUS_PER_NODE=2
-GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
+GEN_NGPUS_PER_NODE=4
+# Under dynamic_parallel the slot table sets the instance count, so this is a placeholder.
+GEN_INSTANCES=1
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
 TRAIN_NNODES=1
-TRAIN_NGPUS_PER_NODE=6
+TRAIN_NGPUS_PER_NODE=4
 
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
@@ -64,7 +74,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
-    psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
+    psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE} \
     psrl.deployment.n_validate_instances=${VAL_INSTANCES} \
     psrl.deployment.validate_nnodes_per_instance=1 \
     psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -120,7 +130,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     gen_actor_rollout_ref.rollout.data_parallel_size=${GEN_DP} \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
     gen_actor_rollout_ref.rollout.n=$rollout_N \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=12800\
     \
@@ -134,20 +144,27 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     \
     psrl.rollout_coordination.sync_and_mig_strategy.method="greedy" \
     \
+    psrl.dynamic_parallel.enable=True \
+    psrl.dynamic_parallel.tp_degrees='[1,2]' \
+    psrl.dynamic_parallel.tp_schedule='[1,2]' \
+    psrl.dynamic_parallel.switch_on_boundary=True \
+    psrl.tms.range=gen \
+    psrl.tms.enable_cuda_graph=True \
+    \
     psrl.rollout_coordination.partial_rollout.enable=True \
     \
-    psrl.colocate_validate_and_train=True \
+    psrl.colocate_validate_and_train=False \
     \
     reward.launch_reward_fn_async=True \
     \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.val_before_train=False \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.total_training_steps=5 \
+    trainer.total_training_steps=3 \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.total_epochs=15 $@ 2>&1 | tee "train_loopback_fix.log"
+    trainer.total_epochs=15 $@ 2>&1 | tee "train_dynamic_parallel.log"

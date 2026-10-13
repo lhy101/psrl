@@ -37,12 +37,15 @@ class GreedySyncMixin:
                 self.config.psrl.rollout_coordination.sync_and_mig_strategy.check_interval_in_ms / 1000
             )
 
+            # Apply any parallelism replan before choosing sync candidates, so the
+            # awake set this tick reads is the one the boundary decided on.
+            await self.consume_pending_parallelism_switch()
+
             have_syncing_instance = False
             sync_instance_ids = []
             for instance_id in self.instance_ids:
-                # Ignore validate instances for weight synchronization
-                replica_id, _ = instance_id
-                if replica_id not in self.tag_to_replica_ids["rollout"]:
+                # Skip validate instances and, under dynamic parallelism, asleep slots.
+                if not self.is_syncable_instance(instance_id):
                     continue
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if self.instance_to_model_version.get(
